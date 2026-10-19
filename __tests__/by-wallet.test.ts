@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import type { Request, Response } from "express";
 import { resetByWalletRateLimitBuckets } from "../src/middleware/rateLimiter.js";
 import {
@@ -243,6 +244,30 @@ describe("getJobsByWallet() – unit", () => {
     expect(result.jobs[0].role).toBe("client");
   });
 
+  it("a contract with two events in its latest ledger appears exactly once (#707)", async () => {
+    const addr = "GDUPECHECK";
+    seedEvent(testDb, {
+      contractId: "C-DUP",
+      eventType: "fund",
+      ledger: 200,
+      timestamp: 2000,
+      dataJson: JSON.stringify({ client: addr }),
+    });
+    seedEvent(testDb, {
+      contractId: "C-DUP",
+      eventType: "extend",
+      ledger: 200,
+      timestamp: 2001,
+      dataJson: JSON.stringify({ client: addr }),
+    });
+
+    const result = await getJobsByWallet(addr, 1, 10);
+    expect(result.total).toBe(1);
+    expect(result.jobs).toHaveLength(1);
+    expect(result.jobs[0].contract_id).toBe("C-DUP");
+    expect(result.jobs.length).toBeLessThanOrEqual(10);
+  });
+
   // -------------------------------------------------------------------------
   // Pagination – unit layer
   // -------------------------------------------------------------------------
@@ -317,9 +342,8 @@ describe("GET /api/jobs/by-wallet/:address – HTTP", () => {
     // Dynamically import the router AFTER setDb() so it uses the in-memory DB
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
-    // Ensure no API_KEY gate is active for the baseline HTTP suite
-    delete process.env.API_KEY;
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
@@ -430,6 +454,7 @@ describe("GET /api/jobs/by-wallet/:address – Zod middleware", () => {
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
@@ -549,11 +574,11 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
     const { default: router } = await import("../src/routes/jobs.js");
     app = express();
     app.use(express.json());
+    app.use(autoAuth);
     app.use("/api/jobs", router);
   });
 
   afterEach(() => {
-    delete process.env.API_KEY;
     resetJobsByWalletCache();
   });
 
@@ -634,42 +659,37 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 401 – missing or wrong API key when API_KEY env var is set
+  // Deliberately unauthenticated.
+  //
+  // This endpoint returns only data the indexer read from public Soroban
+  // events, so it no longer requires x-api-key. These tests replace the
+  // previous 401 suite and exist to stop the gate being reintroduced by
+  // accident: the browser cannot hold a secret, so a key here only ever
+  // blocked the dashboard from reading its own job list.
   // -------------------------------------------------------------------------
 
-  it("returns 401 when API_KEY is set and no key is provided", async () => {
+  it("returns 200 without an API key even when API_KEY is set", async () => {
     process.env.API_KEY = "secret-test-key";
 
     const res = await request(app)
       .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .expect(401);
-
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-  });
-
-  it("returns 401 when API_KEY is set and wrong key is provided", async () => {
-    process.env.API_KEY = "secret-test-key";
-
-    const res = await request(app)
-      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .set("x-api-key", "wrong-key")
-      .expect(401);
-
-    expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-  });
-
-  it("returns 200 when API_KEY is set and correct key is provided", async () => {
-    process.env.API_KEY = "secret-test-key";
-
-    const res = await request(app)
-      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
-      .set("x-api-key", "secret-test-key")
       .expect(200);
 
     expect(res.body.success).toBe(true);
   });
 
-  it("returns 200 (no gate) when API_KEY env var is not set", async () => {
+  it("ignores a wrong API key rather than rejecting it", async () => {
+    process.env.API_KEY = "secret-test-key";
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .set("x-api-key", "wrong-key")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+  });
+
+  it("returns 200 when API_KEY is not configured at all", async () => {
     delete process.env.API_KEY;
 
     const res = await request(app)
@@ -677,6 +697,25 @@ describe("GET /api/jobs/by-wallet/:address – status codes", () => {
       .expect(200);
 
     expect(res.body.success).toBe(true);
+  });
+
+  it("never returns fields beyond the public event summary", async () => {
+    delete process.env.API_KEY;
+
+    const res = await request(app)
+      .get(`/api/jobs/by-wallet/${VALID_WALLET}`)
+      .expect(200);
+
+    for (const job of res.body.data.jobs) {
+      expect(Object.keys(job).sort()).toEqual([
+        "contract_id",
+        "latest_event_type",
+        "latest_ledger",
+        "latest_timestamp",
+        "milestone_count",
+        "role",
+      ]);
+    }
   });
 
   // -------------------------------------------------------------------------

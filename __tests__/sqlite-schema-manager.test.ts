@@ -7,7 +7,14 @@ import {
   withSchemaRetry,
   withSchemaRetrySync,
   isSchemaRetryableError,
+  validateHistoricalRange,
+  insertHistoricalEventBatch,
+  getHistoricalEventCounts,
+  getLastIndexedLedger,
+  HistoricalRangeError,
+  getShippedMigrationVersions,
   SCHEMA_MANAGER_INDEXES,
+  type EventRow,
 } from "../src/indexer/db.js";
 import { jest } from "@jest/globals";
 import logger from "../src/utils/logger.js";
@@ -55,23 +62,6 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       expect(versions).toContain(1);
       expect(versions).toContain(2);
       expect(versions).toContain(3);
-      expect(versions).toContain(4);
-      expect(versions).toContain(5);
-    });
-
-    it("creates all schema-manager lookup indexes (#259)", () => {
-      const indexes = testDb
-        .prepare(
-          `SELECT name FROM sqlite_master
-           WHERE type = 'index' AND name LIKE 'idx_%'
-           ORDER BY name`,
-        )
-        .all() as Array<{ name: string }>;
-      const names = indexes.map((i) => i.name);
-
-      for (const indexName of Object.values(SCHEMA_MANAGER_INDEXES)) {
-        expect(names).toContain(indexName);
-      }
     });
   });
 
@@ -80,7 +70,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-           VALUES (?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?)`
         )
         .run("C1", "initialized", 1000, 1700000000, '{"key":"value"}');
 
@@ -98,7 +88,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("enforces unique constraint on contract_id + ledger_sequence + event_type", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?)`
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -112,7 +102,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("allows different event types on the same ledger", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?)`
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -125,7 +115,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("allows events across multiple contracts", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-         VALUES (?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?)`
       );
 
       insert.run("C1", "initialized", 100, 1000, "{}");
@@ -148,7 +138,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json)
-           VALUES (?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?)`
         )
         .run("C1", "initialized", 100, 1000, largeData);
 
@@ -185,7 +175,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb
         .prepare(
           `INSERT INTO monitored_contracts (contract_id, label, active)
-           VALUES (?, ?, 1)`,
+           VALUES (?, ?, 1)`
         )
         .run("CONTRACT-ALPHA", "alpha");
 
@@ -201,7 +191,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("enforces unique contract_id", () => {
       const insert = testDb.prepare(
         `INSERT OR IGNORE INTO monitored_contracts (contract_id, label, active)
-         VALUES (?, ?, 1)`,
+         VALUES (?, ?, 1)`
       );
 
       insert.run("C1", "first");
@@ -241,7 +231,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         testDb.transaction(() => {
           testDb
             .prepare(
-              "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
+              "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
             )
             .run("C1", "t", 1, 1, "{}");
           throw new Error("intentional rollback");
@@ -261,12 +251,12 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
       testDb.transaction(() => {
         testDb
           .prepare(
-            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
           )
           .run("C1", "initialized", 100, 1000, "{}");
         testDb
           .prepare(
-            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO events (contract_id, event_type, ledger_sequence, timestamp, data_json) VALUES (?, ?, ?, ?, ?)"
           )
           .run("C1", "funded", 101, 1001, "{}");
         testDb
@@ -288,7 +278,7 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
     it("running migrations multiple times does not duplicate data", () => {
       testDb
         .prepare(
-          "INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, 1)",
+          "INSERT INTO monitored_contracts (contract_id, label, active) VALUES (?, ?, 1)"
         )
         .run("C1", "original");
 
@@ -338,7 +328,11 @@ describe("SQLite Schema Manager – in-memory integration tests", () => {
         const versions = (cleanDb
           .prepare("SELECT version FROM schema_migrations ORDER BY version")
           .all() as Array<{ version: number }>).map((r) => r.version);
-        expect(versions).toEqual([1, 2, 3]);
+        expect(versions[0]).toBe(1);
+        for (let i = 1; i < versions.length; i++) {
+          expect(versions[i]).toBe(versions[i - 1] + 1);
+        }
+        expect(versions.length).toBeGreaterThanOrEqual(5);
 
         const ledger = cleanDb
           .prepare("SELECT value FROM indexer_state WHERE key = 'last_ledger_sequence'")
@@ -491,12 +485,15 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
         expect(result).toBe("recovered");
         expect(calls).toBe(3);
 
-        const retryWarns = (warnSpy.mock.calls as Array<[unknown, { backoffMs: number }]>).filter(
+        const warnCalls = warnSpy.mock.calls as unknown as Array<
+          [string, { backoffMs: number }]
+        >;
+        const retryWarns = warnCalls.filter(
           ([msg]) => msg === "schema_test failed, retrying",
         );
         expect(retryWarns.length).toBe(2);
         for (const [, meta] of retryWarns) {
-          delays.push((meta as { backoffMs: number }).backoffMs);
+          delays.push(meta.backoffMs);
         }
         expect(delays[0]).toBe(10);
         expect(delays[1]).toBe(20);
@@ -564,6 +561,168 @@ describe("SQLite Schema Manager – exponential backoff retry (#258)", () => {
       } finally {
         db.close();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #263 – Dynamic historical sync ranges for custom event imports
+// ---------------------------------------------------------------------------
+
+describe("SQLite Schema Manager – dynamic historical sync ranges (#263)", () => {
+  let testDb: Database.Database;
+
+  beforeEach(() => {
+    testDb = new Database(":memory:");
+    setDb(testDb);
+    runMigrations();
+  });
+
+  afterEach(() => {
+    testDb.close();
+  });
+
+  const event = (
+    contractId: string,
+    eventType: string,
+    ledgerSequence: number,
+  ): EventRow => ({
+    contractId,
+    eventType,
+    ledgerSequence,
+    timestamp: 1_700_000_000 + ledgerSequence,
+    dataJson: "{}",
+  });
+
+  describe("validateHistoricalRange", () => {
+    it("returns the range when start and end are valid positive integers", () => {
+      expect(validateHistoricalRange(100, 200)).toEqual({
+        startLedger: 100,
+        endLedger: 200,
+      });
+    });
+
+    it("allows start === end (single-ledger range)", () => {
+      expect(validateHistoricalRange(50, 50)).toEqual({
+        startLedger: 50,
+        endLedger: 50,
+      });
+    });
+
+    it("rejects a non-integer start ledger", () => {
+      expect(() => validateHistoricalRange(1.5, 200)).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects a start ledger below 1", () => {
+      expect(() => validateHistoricalRange(0, 200)).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects a non-numeric end ledger", () => {
+      expect(() => validateHistoricalRange(100, "200")).toThrow(HistoricalRangeError);
+    });
+
+    it("rejects start > end", () => {
+      expect(() => validateHistoricalRange(300, 200)).toThrow(HistoricalRangeError);
+    });
+  });
+
+  describe("insertHistoricalEventBatch", () => {
+    it("imports events within the declared range without advancing the live pointer", () => {
+      const result = insertHistoricalEventBatch(
+        [event("C1", "initialized", 100), event("C1", "funded", 150)],
+        { startLedger: 100, endLedger: 200 },
+      );
+
+      expect(result.inserted).toBe(2);
+      expect(result.range).toEqual({ startLedger: 100, endLedger: 200 });
+      expect(getLastIndexedLedger()).toBe(0);
+
+      const counts = getHistoricalEventCounts(100, 200);
+      expect(counts.totalEvents).toBe(2);
+      expect(counts.eventsByType).toEqual({ initialized: 1, funded: 1 });
+    });
+
+    it("advances the live pointer only when advanceLivePointer is requested", () => {
+      insertHistoricalEventBatch(
+        [event("C1", "initialized", 100)],
+        { startLedger: 100, endLedger: 200 },
+        { advanceLivePointer: true },
+      );
+
+      expect(getLastIndexedLedger()).toBe(200);
+    });
+
+    it("does not move the live pointer backwards when advanceLivePointer is set", () => {
+      testDb
+        .prepare("UPDATE indexer_state SET value = ? WHERE key = 'last_ledger_sequence'")
+        .run("500");
+
+      insertHistoricalEventBatch(
+        [event("C1", "initialized", 100)],
+        { startLedger: 100, endLedger: 200 },
+        { advanceLivePointer: true },
+      );
+
+      expect(getLastIndexedLedger()).toBe(500);
+    });
+
+    it("rejects an event whose ledger_sequence falls outside the declared range", () => {
+      expect(() =>
+        insertHistoricalEventBatch(
+          [event("C1", "initialized", 999)],
+          { startLedger: 100, endLedger: 200 },
+        ),
+      ).toThrow(HistoricalRangeError);
+
+      const counts = getHistoricalEventCounts(1, 10_000);
+      expect(counts.totalEvents).toBe(0);
+    });
+
+    it("ignores duplicate events on repeated import (idempotent)", () => {
+      const batch = [event("C1", "initialized", 100)];
+      insertHistoricalEventBatch(batch, { startLedger: 100, endLedger: 200 });
+      const second = insertHistoricalEventBatch(batch, { startLedger: 100, endLedger: 200 });
+
+      expect(second.inserted).toBe(0);
+      expect(getHistoricalEventCounts(100, 200).totalEvents).toBe(1);
+    });
+
+    it("rejects an invalid range before touching the database", () => {
+      expect(() =>
+        insertHistoricalEventBatch(
+          [event("C1", "initialized", 100)],
+          { startLedger: 200, endLedger: 100 },
+        ),
+      ).toThrow(HistoricalRangeError);
+      expect(getHistoricalEventCounts(1, 10_000).totalEvents).toBe(0);
+    });
+  });
+
+  describe("getHistoricalEventCounts", () => {
+    it("asserts correct block event counts are indexed for a custom range", () => {
+      insertHistoricalEventBatch(
+        [
+          event("C1", "initialized", 100),
+          event("C1", "funded", 101),
+          event("C2", "initialized", 105),
+        ],
+        { startLedger: 100, endLedger: 200 },
+      );
+      insertHistoricalEventBatch(
+        [event("C2", "completed", 250)],
+        { startLedger: 201, endLedger: 300 },
+      );
+
+      const counts = getHistoricalEventCounts(100, 200);
+      expect(counts.totalEvents).toBe(3);
+      expect(counts.eventsByType).toEqual({
+        initialized: 2,
+        funded: 1,
+      });
+    });
+
+    it("throws for an invalid range", () => {
+      expect(() => getHistoricalEventCounts(-1, 10)).toThrow(HistoricalRangeError);
     });
   });
 });

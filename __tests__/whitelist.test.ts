@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 import { resetJobWhitelistRateLimitBuckets } from "../src/middleware/job-contract-rate-limit.js";
 
 const VALID_CONTRACT =
@@ -33,6 +34,7 @@ const { default: router, resetWhitelistCache } = await import("../src/routes/job
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -52,7 +54,6 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
     resetJobWhitelistRateLimitBuckets();
     resetWhitelistCache();
 
-    delete process.env.API_KEY;
     delete process.env.JOB_WHITELIST_RATE_MAX;
     delete process.env.JOB_WHITELIST_RATE_WINDOW_MS;
     delete process.env.ALLOWED_ORIGINS;
@@ -171,26 +172,42 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
 
   // --- ISSUE #45: Standardize Responses and HTTP Codes ---
   describe("Standard Responses and HTTP Codes (Issue #45)", () => {
-    it("returns 401 when API_KEY is configured and the header is missing", async () => {
+    // Public on-chain read; the browser cannot hold a secret, so no API key
+    // is required whether or not one is configured (#693).
+    it("returns 200 when API_KEY is configured and the header is missing", async () => {
       process.env.API_KEY = "secret-key";
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: [] } });
 
       const res = await request(buildApp())
         .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
-        .expect(401);
+        .expect(200);
 
-      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
-      expect(mockGetAccount).not.toHaveBeenCalled();
+      expect(res.body).toEqual({ success: true, data: { tokens: [] } });
+      expect(mockGetAccount).toHaveBeenCalled();
     });
 
-    it("returns 401 when API_KEY is configured and the header is wrong", async () => {
+    it("ignores a wrong x-api-key header instead of rejecting it", async () => {
       process.env.API_KEY = "secret-key";
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: [] } });
 
       const res = await request(buildApp())
         .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
         .set("x-api-key", "wrong-key")
-        .expect(401);
+        .expect(200);
 
-      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+      expect(res.body).toEqual({ success: true, data: { tokens: [] } });
+    });
+
+    it("returns 200 when API_KEY is not set", async () => {
+      delete process.env.API_KEY;
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: [] } });
+
+      const res = await request(buildApp())
+        .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
+        .expect(200);
+
+      expect(res.body).toEqual({ success: true, data: { tokens: [] } });
+      expect(mockGetAccount).toHaveBeenCalled();
     });
 
     it("returns 404 when simulation reports the contract/job was not found", async () => {
@@ -507,6 +524,18 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
       expect(res.body.details[0].field).toBe("contractId");
     });
 
+    it("returns 400 for a contractId with an invalid Stellar checksum", async () => {
+      const invalidChecksum = VALID_CONTRACT.slice(0, -1) + "A";
+      const res = await request(buildApp())
+        .get(`/api/jobs/${invalidChecksum}/whitelist`)
+        .expect(400);
+
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toBe("ValidationError");
+      expect(res.body.details[0].field).toBe("contractId");
+      expect(res.body.details[0].message).toMatch(/valid Stellar contract address/i);
+    });
+
     it("returns 400 for an empty-looking contractId segment", async () => {
       const res = await request(buildApp())
         .get("/api/jobs/INVALID/whitelist")
@@ -540,6 +569,8 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
 
       expect(typeof res.body.error).toBe("string");
       expect(res.body.error.length).toBeGreaterThan(0);
+      expect(typeof res.body.message).toBe("string");
+      expect(res.body.message.length).toBeGreaterThan(0);
     });
 
     it("error details carry the field name for easy client-side parsing", async () => {
@@ -699,16 +730,15 @@ describe("GET /api/jobs/:contractId/whitelist", () => {
       });
     });
 
-    it("logs warn with contractId when the request is unauthorized", async () => {
+    it("does not log an unauthorized warning for key-less requests (#693)", async () => {
       process.env.API_KEY = "secret-key";
+      mockSimulateTransaction.mockResolvedValue({ result: { retval: [] } });
 
       await request(buildApp())
         .get(`/api/jobs/${VALID_CONTRACT}/whitelist`)
-        .expect(401);
+        .expect(200);
 
-      expect(mockLoggerWarn).toHaveBeenCalledWith("Unauthorized request", {
-        contractId: VALID_CONTRACT,
-      });
+      expect(mockLoggerWarn).not.toHaveBeenCalledWith("Unauthorized request", expect.anything());
     });
 
     it("logs warn with contractId when contract/job is not found", async () => {

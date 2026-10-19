@@ -13,7 +13,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
 }));
 
 jest.unstable_mockModule("../src/utils/logger.js", () => ({
-  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
 const { resetBuildTxRateLimitBuckets } = await import("../src/middleware/job-contract-rate-limit.js");
@@ -25,7 +25,7 @@ app.use("/api/jobs", router);
 
 const VALID_BODY = {
   contractId: "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH",
-  method: "fund_job",
+  method: "fund",
   args: [],
   sourceAddress: "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX",
 };

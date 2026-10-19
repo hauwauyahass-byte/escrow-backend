@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 const VALID_ADDRESS = "GAODBHVR63Z56MVQRBEJSYM2H5423LJ4WAPUUBOFG4JYY72S6ROKVZRX";
@@ -15,7 +16,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetPartialReleaseCache } = await import("../src/routes/jobs.js");
 const { resetPartialReleaseRateLimitBuckets } = await import(
   "../src/middleware/job-contract-rate-limit.js"
 );
@@ -23,6 +24,7 @@ const { resetPartialReleaseRateLimitBuckets } = await import(
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -30,11 +32,70 @@ function buildApp() {
 const ENDPOINT = `/api/jobs/${VALID_CONTRACT}/milestones/0/partial-release`;
 const VALID_BODY = { amount: "100", sourceAddress: VALID_ADDRESS };
 
+describe("POST /api/jobs/:contractId/milestones/:index/partial-release – CORS and security headers", () => {
+  it("rejects requests from unauthorized origins", async () => {
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://malicious.com")
+      .send(VALID_BODY)
+      .expect(403);
+
+    expect(res.body).toEqual({
+      success: false,
+      error: "Origin not allowed by CORS policy",
+    });
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("allows trusted origins and sets CORS response headers", async () => {
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_ADDRESS,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://localhost:3000")
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(res.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+    expect(res.headers["access-control-allow-methods"]).toContain("POST");
+    expect(res.headers["access-control-allow-methods"]).toContain("OPTIONS");
+    expect(res.body.success).toBe(true);
+  });
+
+  it("sets required security headers on the response", async () => {
+    mockGetAccount.mockResolvedValue({
+      accountId: () => VALID_ADDRESS,
+      sequenceNumber: () => "1",
+      incrementSequenceNumber: () => {},
+    });
+    mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .set("Origin", "http://localhost:3000")
+      .send(VALID_BODY)
+      .expect(200);
+
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["x-frame-options"]).toBe("DENY");
+    expect(res.headers["referrer-policy"]).toBe("no-referrer");
+    expect(res.headers["x-xss-protection"]).toBe("0");
+    expect(res.headers["content-security-policy"]).toBe("default-src 'none'");
+    expect(res.headers["permissions-policy"]).toContain("camera=()");
+  });
+});
+
 describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
   beforeEach(() => {
     mockGetAccount.mockReset();
     mockPrepareTransaction.mockReset();
     resetPartialReleaseRateLimitBuckets();
+    resetPartialReleaseCache();
 
     mockGetAccount.mockResolvedValue({
       accountId: () => VALID_ADDRESS,
@@ -78,6 +139,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "index must be a non-negative integer",
         },
       ],
+      fields: {
+        index: "index must be a non-negative integer",
+      },
     });
   });
 
@@ -114,6 +178,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "amount must be a positive integer",
         },
       ],
+      fields: {
+        amount: "amount must be a positive integer",
+      },
     });
   });
 
@@ -132,6 +199,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "amount must be a positive integer",
         },
       ],
+      fields: {
+        amount: "amount must be a positive integer",
+      },
     });
   });
 
@@ -150,6 +220,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "amount must be a positive integer",
         },
       ],
+      fields: {
+        amount: "amount must be a positive integer",
+      },
     });
   });
 
@@ -168,6 +241,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "amount must be a positive integer",
         },
       ],
+      fields: {
+        amount: "amount must be a positive integer",
+      },
     });
   });
 
@@ -186,6 +262,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "sourceAddress is required",
         },
       ],
+      fields: {
+        sourceAddress: "sourceAddress is required",
+      },
     });
   });
 
@@ -204,6 +283,9 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
           message: "sourceAddress must be a valid Stellar account address (G...)",
         },
       ],
+      fields: {
+        sourceAddress: "sourceAddress must be a valid Stellar account address (G...)",
+      },
     });
   });
 
@@ -251,8 +333,17 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     });
   });
 
-  it("returns 500 when getAccount throws a generic internal error", async () => {
+  it("returns 504 when getAccount times out upstream (#691)", async () => {
     mockGetAccount.mockRejectedValue(new Error("Database connection timeout"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(504);
+    expect(res.body).toEqual({ success: false, error: "Upstream RPC timeout" });
+  });
+
+  it("returns 500 when getAccount throws a generic internal error", async () => {
+    mockGetAccount.mockRejectedValue(new Error("Unexpected internal failure"));
     const res = await request(buildApp())
       .post(ENDPOINT)
       .send(VALID_BODY)
@@ -275,8 +366,17 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     });
   });
 
+  it("returns 504 when prepareTransaction times out upstream (#691)", async () => {
+    mockPrepareTransaction.mockRejectedValue(new Error("socket hang up"));
+    const res = await request(buildApp())
+      .post(ENDPOINT)
+      .send(VALID_BODY)
+      .expect(504);
+    expect(res.body).toEqual({ success: false, error: "Upstream RPC timeout" });
+  });
+
   it("returns 500 when prepareTransaction throws a generic internal error", async () => {
-    mockPrepareTransaction.mockRejectedValue(new Error("Database connection timeout"));
+    mockPrepareTransaction.mockRejectedValue(new Error("Unexpected internal failure"));
     const res = await request(buildApp())
       .post(ENDPOINT)
       .send(VALID_BODY)
@@ -287,9 +387,11 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     });
   });
 
-  // ── API_KEY gate ──────────────────────────────────────────────────────────
+  // ── API key not required (#693) ───────────────────────────────────────────
+  // The route only builds an unsigned XDR the caller's own wallet must sign,
+  // so it is deliberately public: a browser cannot hold a secret key.
 
-  describe("API_KEY gate", () => {
+  describe("API key not required (#693)", () => {
     const originalApiKey = process.env.API_KEY;
 
     beforeEach(() => {
@@ -298,24 +400,28 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
     });
 
     afterEach(() => {
-      process.env.API_KEY = originalApiKey;
+      if (originalApiKey === undefined) {
+        delete process.env.API_KEY;
+      } else {
+        process.env.API_KEY = originalApiKey;
+      }
     });
 
-    it("returns 401 when API_KEY is set and no key is provided", async () => {
+    it("returns 200 when API_KEY is set and no key is provided", async () => {
       const res = await request(buildApp())
         .post(ENDPOINT)
         .send(VALID_BODY)
-        .expect(401);
-      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+        .expect(200);
+      expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
     });
 
-    it("returns 401 when API_KEY is set and wrong key is provided", async () => {
+    it("ignores a wrong x-api-key header instead of rejecting it", async () => {
       const res = await request(buildApp())
         .post(ENDPOINT)
         .set("x-api-key", "wrong-key")
         .send(VALID_BODY)
-        .expect(401);
-      expect(res.body).toEqual({ success: false, error: "Unauthorized" });
+        .expect(200);
+      expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
     });
 
     it("returns 200 when API_KEY is set and correct key is provided", async () => {
@@ -327,13 +433,13 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
       expect(res.body.success).toBe(true);
     });
 
-    it("returns 200 (no gate) when API_KEY is not set", async () => {
+    it("returns 200 when API_KEY is not configured at all", async () => {
       delete process.env.API_KEY;
       const res = await request(buildApp())
         .post(ENDPOINT)
         .send(VALID_BODY)
         .expect(200);
-      expect(res.body.success).toBe(true);
+      expect(res.body).toEqual({ success: true, xdr: "AAAAAQ==" });
     });
   });
 
@@ -392,6 +498,49 @@ describe("POST /api/jobs/:contractId/milestones/:index/partial-release", () => {
       expect(res.headers["x-ratelimit-limit"]).toBeDefined();
       expect(res.headers["x-ratelimit-remaining"]).toBeDefined();
       expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+    });
+  });
+
+  // --- ISSUE #116: Node-Cache in-memory caching ---
+  describe("Node-Cache in-memory caching (Issue #116)", () => {
+    beforeEach(() => {
+      mockPrepareTransaction.mockResolvedValue({ toXDR: () => "AAAAAQ==" });
+    });
+
+    it("serves concurrent requests from the in-flight cache, hitting Soroban only once", async () => {
+      const app = buildApp();
+      
+      let resolvePrepare: (val: any) => void;
+      mockPrepareTransaction.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePrepare = resolve;
+        })
+      );
+
+      const req1 = request(app).post(ENDPOINT).send(VALID_BODY);
+      const req2 = request(app).post(ENDPOINT).send(VALID_BODY);
+
+      await new Promise((r) => setTimeout(r, 50));
+      resolvePrepare!({ toXDR: () => "AAAAAQ==" });
+
+      const [res1, res2] = await Promise.all([req1, req2]);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(res1.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+      expect(res2.body).toEqual({ success: true, xdr: "AAAAAQ==" });
+      expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it("serves subsequent requests from NodeCache, hitting Soroban only once", async () => {
+      const app = buildApp();
+      
+      const res1 = await request(app).post(ENDPOINT).send(VALID_BODY);
+      const res2 = await request(app).post(ENDPOINT).send(VALID_BODY);
+
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(200);
+      expect(mockPrepareTransaction).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -6,6 +6,7 @@ import {
   TransactionBuilder,
   BASE_FEE,
   nativeToScVal,
+  scValToNative,
   Address,
 } from "@stellar/stellar-sdk";
 import { Server } from "@stellar/stellar-sdk/rpc";
@@ -14,6 +15,7 @@ import { getJobsByWallet, getEventsByContract } from "../indexer/db.js";
 import {
   jobContractRateLimit,
   jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   partialReleaseRateLimit,
   buildTxRateLimit,
   timeRemainingRateLimit,
@@ -32,31 +34,46 @@ import {
   timeRemainingSecurityHeaders,
   byWalletCors,
   byWalletSecurityHeaders,
+  partialReleaseCors,
+  partialReleaseSecurityHeaders,
   claimAutoReleaseCors,
   claimAutoReleaseSecurityHeaders,
+  updateWhitelistCors,
+  updateWhitelistSecurityHeaders,
+  buildTxCors,
+  buildTxSecurityHeaders,
 } from "../middleware/job-contract-security.js";
 import { sendError, sendSuccess } from "../utils/api-response.js";
 import { validate, validateWithFields } from "../middleware/validate.js";
 import type { RequestWithValidatedQuery } from "../middleware/validate.js";
+import { createJobDraftValidation } from "../middleware/create-job-draft-validation.js";
 import {
   contractIdParamsSchema,
+  whitelistParamsSchema,
   contractMilestoneParamsSchema,
   // Schema for building transaction requests
   buildTxBodySchema,
   submitBodySchema,
   partialReleaseBodySchema,
   claimAutoReleaseBodySchema,
-  whitelistUpdateBodySchema,
   byWalletParamsSchema,
   byWalletQuerySchema,
   createJobDraftBodySchema,
   createJobDraftLegacyBodySchema,
+  whitelistUpdateBodySchema,
+  whitelistUpdateRequestSchema,
+  feePreviewQuerySchema,
   type ByWalletQuery,
   type CreateJobDraftBody,
   type CreateJobDraftLegacyBody,
+  type UpdateWhitelistBody,
+  type WhitelistUpdateBody,
+  type WhitelistUpdateRequestBody,
+  type FeePreviewQuery,
 } from "../schemas/jobs.js";
 import { strictLimiter, walletLookupLimiter } from "../middleware/rateLimiter.js";
 import logger from "../utils/logger.js";
+import { isValidStellarContractId } from "../utils/stellar.js";
 import { randomUUID } from "crypto";
 
 const router = Router();
@@ -65,7 +82,47 @@ const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE =
   process.env.SOROBAN_NETWORK_PASSPHRASE || Networks.TESTNET;
-const server = new Server(RPC_URL);
+
+// #691: Apply an explicit HTTP timeout so stalled RPC connections surface as
+// a 504 rather than hanging indefinitely. Default 10 s; override via env.
+const RPC_TIMEOUT_MS = parseInt(process.env.RPC_TIMEOUT_MS || "10000", 10);
+const server = new Server(RPC_URL, { timeout: RPC_TIMEOUT_MS });
+
+/**
+ * #692: Validate that the configured SOROBAN_NETWORK_PASSPHRASE matches the
+ * passphrase the RPC server actually reports. Called once at startup.
+ *
+ * Throws with a descriptive message on any mismatch so the process exits
+ * before serving any traffic with the wrong network config.
+ */
+export async function assertRpcNetworkMatches(): Promise<void> {
+  const localPassphrase =
+    process.env.SOROBAN_NETWORK_PASSPHRASE || Networks.TESTNET;
+
+  let rpcPassphrase: string;
+  try {
+    const network = await server.getNetwork();
+    rpcPassphrase = network.passphrase;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Startup network check failed – could not reach RPC at ${RPC_URL}: ${msg}`,
+    );
+  }
+
+  if (rpcPassphrase !== localPassphrase) {
+    throw new Error(
+      `Network passphrase mismatch: RPC reported "${rpcPassphrase}" ` +
+        `but SOROBAN_NETWORK_PASSPHRASE is set to "${localPassphrase}". ` +
+        `Refusing to start to prevent transactions being built for the wrong network.`,
+    );
+  }
+
+  logger.info("RPC network verified", {
+    network: rpcPassphrase === Networks.TESTNET ? "testnet" : "public",
+    rpc: RPC_URL,
+  });
+}
 
 const WHITELIST_TTL = parseInt(process.env.WHITELIST_CACHE_TTL_S || "60", 10);
 export const whitelistCache = new NodeCache({ stdTTL: WHITELIST_TTL, useClones: false });
@@ -73,20 +130,6 @@ const inFlightWhitelistRequests = new Map<string, Promise<string[]>>();
 export function resetWhitelistCache(): void {
   whitelistCache.flushAll();
   inFlightWhitelistRequests.clear();
-}
-
-const WHITELIST_UPDATE_TTL = parseInt(
-  process.env.WHITELIST_UPDATE_CACHE_TTL_S || "60",
-  10,
-);
-export const whitelistUpdateCache = new NodeCache({
-  stdTTL: WHITELIST_UPDATE_TTL,
-  useClones: false,
-});
-const inFlightWhitelistUpdateRequests = new Map<string, Promise<string>>();
-export function resetWhitelistUpdateCache(): void {
-  whitelistUpdateCache.flushAll();
-  inFlightWhitelistUpdateRequests.clear();
 }
 
 const CLAIM_AUTO_RELEASE_TTL = parseInt(
@@ -153,6 +196,53 @@ export function resetTimeRemainingCache(): void {
   inFlightTimeRemainingRequests.clear();
 }
 
+const PARTIAL_RELEASE_CACHE_TTL = parseInt(
+  process.env.PARTIAL_RELEASE_CACHE_TTL_S || "30",
+  10,
+);
+export const partialReleaseCache = new NodeCache({
+  stdTTL: PARTIAL_RELEASE_CACHE_TTL,
+  useClones: false,
+});
+const inFlightPartialReleaseRequests = new Map<string, Promise<string>>();
+export function resetPartialReleaseCache(): void {
+  partialReleaseCache.flushAll();
+  inFlightPartialReleaseRequests.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Fee preview cache (#719)
+// ---------------------------------------------------------------------------
+
+const FEE_PREVIEW_CACHE_TTL = parseInt(
+  process.env.FEE_PREVIEW_CACHE_TTL_S || "30",
+  10,
+);
+export const feePreviewCache = new NodeCache({
+  stdTTL: FEE_PREVIEW_CACHE_TTL,
+  useClones: false,
+});
+const inFlightFeePreviewRequests = new Map<string, Promise<unknown>>();
+export function resetFeePreviewCache(): void {
+  feePreviewCache.flushAll();
+  inFlightFeePreviewRequests.clear();
+}
+
+/**
+ * Cache key for a partial-release build. The amount and source address are
+ * part of the key because each combination produces a different unsigned
+ * transaction — keying on the contract and milestone alone would serve one
+ * caller another caller's XDR.
+ */
+function partialReleaseCacheKey(
+  contractId: string,
+  index: string | number,
+  amount: unknown,
+  sourceAddress: string,
+): string {
+  return `${contractId}:${index}:${String(amount)}:${sourceAddress}`;
+}
+
 // ---------------------------------------------------------------------------
 // Simulation error helpers  (#83)
 // ---------------------------------------------------------------------------
@@ -168,6 +258,11 @@ export function resetTimeRemainingCache(): void {
  *  - Everything else → 500
  */
 function classifySimError(rawError: string): { status: number; message: string } {
+  // 504 – upstream RPC stalled or timed out (#691)
+  if (/timeout|ETIMEDOUT|ECONNRESET|socket hang up|request timeout|connect timeout/i.test(rawError)) {
+    return { status: 504, message: "Upstream RPC timeout" };
+  }
+
   // 404 – source account missing on the network
   if (/missing account|account not found/i.test(rawError)) {
     return { status: 404, message: "Source account not found on network" };
@@ -216,6 +311,11 @@ class SimError extends Error {
 type Classified = { status: number; message: string };
 
 function classifySubmitError(rawError: string): Classified {
+  // 504 – upstream RPC stalled or timed out (#691)
+  if (/timeout|ETIMEDOUT|ECONNRESET|socket hang up|request timeout|connect timeout/i.test(rawError)) {
+    return { status: 504, message: "Upstream RPC timeout" };
+  }
+
   // 401 – authentication / signature / authorization failures
   if (
     /unauthorized|401/i.test(rawError) ||
@@ -287,12 +387,41 @@ const parseJobFromResult = (result: any, contractId: string) => {
   return null;
 };
 
+/**
+ * Convert a value produced by `scValToNative` into a JSON-safe structure
+ * where all numeric amounts are returned as decimal strings (#719).
+ * Handles Maps (contract return values), Arrays, bigints, and primitives.
+ */
+function convertScValToNativeStrings(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" || typeof value === "string" || typeof value === "boolean")
+    return value;
+  if (Array.isArray(value)) return value.map(convertScValToNativeStrings);
+  if (value instanceof Map) {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of value) {
+      obj[String(k)] = convertScValToNativeStrings(v);
+    }
+    return obj;
+  }
+  if (typeof value === "object") {
+    const obj: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      obj[k] = convertScValToNativeStrings(v);
+    }
+    return obj;
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/jobs/by-wallet/:address
 // Returns all jobs (from local SQLite event index) where the address is
 // the client, freelancer, or arbiter.
 // Query params: ?page=1&limit=10
 // ---------------------------------------------------------------------------
+
 router.options("/by-wallet/:address", byWalletCors);
 
 router.get(
@@ -308,16 +437,16 @@ router.get(
   async (req: Request, res: Response) => {
     const address = req.params.address as string;
 
-    // Optional API-key gate (same pattern as GET /:contractId)
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized by-wallet request", { address });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    // Deliberately unauthenticated. Every field this returns (contract_id,
+    // role, milestone_count, latest_event_type, latest_ledger,
+    // latest_timestamp) is derived from Soroban contract events that the
+    // indexer reads from public RPC, so an API key here protected nothing
+    // that is not already on the ledger. It only stopped the browser, which
+    // cannot hold a secret, from reading its own job list.
+    //
+    // It is still a reverse index (address -> contracts) that the chain does
+    // not offer directly, so nginx rate limits this path separately. See
+    // escrow-frontend/nginx.conf, zone=api_public_read.
 
     try {
       const { page, limit } = (req as RequestWithValidatedQuery)
@@ -347,37 +476,28 @@ router.options("/create-job-draft", createJobDraftCors);
  * the first could ever run, so the second PR's rate limiter was dead code and
  * its tests failed. They are collapsed here into one route that honours both
  * contracts: the body is validated against whichever schema matches the field
- * naming used, and the response carries both shapes.
+ * naming used, and the response carries both shapes. The Zod request-shape
+ * validation itself lives in the reusable `createJobDraftValidation`
+ * middleware (see `middleware/create-job-draft-validation.ts`).
  */
-function createJobDraftRouteValidator(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
-  const body = req.body as Record<string, unknown> | undefined;
-  const usesAddressSuffix =
-    !!body &&
-    typeof body === "object" &&
-    ["clientAddress", "freelancerAddress", "arbiterAddress", "tokenAddress"].some(
-      (field) => field in body,
-    );
-
-  const schema = usesAddressSuffix
-    ? createJobDraftLegacyBodySchema
-    : createJobDraftBodySchema;
-
-  validate(schema, "body", (r) =>
-    logger.warn("Invalid create-job-draft request body", { body: r.body }),
-  )(req, res, next);
-}
 
 router.post(
   "/create-job-draft",
   createJobDraftCors,
   createJobDraftSecurityHeaders,
   createJobDraftRateLimit,
-  createJobDraftRouteValidator,
+  createJobDraftValidation,
   (req: Request, res: Response) => {
+    const traceId = randomUUID();
+    const pathVars = { route: "/api/jobs/create-job-draft" };
+
+    logger.debug("Create-job-draft handler entered", {
+      traceId,
+      ...pathVars,
+      bodyKeys: Object.keys((req.body as Record<string, unknown>) ?? {}),
+      ip: req.ip ?? req.socket?.remoteAddress,
+    });
+
     try {
       const body = req.body as Partial<CreateJobDraftBody> &
         Partial<CreateJobDraftLegacyBody>;
@@ -409,7 +529,15 @@ router.post(
         },
       };
 
+      logger.debug("Create-job-draft draft built", {
+        traceId,
+        ...pathVars,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
+
       logger.info("Job draft created", {
+        traceId,
+        ...pathVars,
         client,
         freelancer,
         arbiter,
@@ -418,14 +546,109 @@ router.post(
       });
 
       sendSuccess(res, draft);
+
+      logger.debug("Create-job-draft response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        draftId: draft.id,
+        milestoneCount: body.milestones?.length ?? 0,
+      });
     } catch (err: any) {
-      logger.error("Failed to create job draft", { error: err?.message });
+      const message = err?.message ?? String(err);
+      logger.error("Failed to create job draft", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
 );
 
+// ---------------------------------------------------------------------------
+// GET|POST /api/jobs/query – allowlisted read-only contract views (#696)
+// ---------------------------------------------------------------------------
+// The frontend calls this path; arbitrary method simulation is never allowed.
+const READ_ONLY_QUERY_METHODS = new Set([
+  "is_paused",
+  "get_whitelisted_tokens",
+  "get_platform_fee_allocation",
+]);
+
+async function handleReadOnlyQuery(req: Request, res: Response): Promise<void> {
+  const contractId = req.method === "GET" ? req.query.contractId : req.body?.contractId;
+  const method = req.method === "GET" ? req.query.method : req.body?.method;
+  if (typeof contractId !== "string" || !contractId.trim()) {
+    sendError(res, 400, "contractId is required");
+    return;
+  }
+  if (!isValidStellarContractId(contractId)) {
+    sendError(res, 400, "contractId must be a valid Stellar contract address (C...)");
+    return;
+  }
+  if (typeof method !== "string" || !READ_ONLY_QUERY_METHODS.has(method)) {
+    sendError(res, 400, "Unsupported query method");
+    return;
+  }
+
+  try {
+    const contract = new Contract(contractId);
+    const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(method))
+      .setTimeout(30)
+      .build();
+    const result = await server.simulateTransaction(tx);
+
+    if ("error" in result) {
+      const { status, message } = classifySimError(String(result.error));
+      sendError(res, status, message);
+      return;
+    }
+    if (!("result" in result) || !result.result?.retval) {
+      sendError(res, 500, "Internal server error");
+      return;
+    }
+
+    // i128/u64 values decode to bigint, which JSON cannot carry; send strings.
+    sendSuccess(res, {
+      contractId,
+      method,
+      result: convertScValToNativeStrings(scValToNative(result.result.retval)),
+    });
+  } catch (err: unknown) {
+    logger.error("Read-only contract query failed", {
+      contractId,
+      method,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    sendError(res, 500, "Internal server error");
+  }
+}
+
+router.get("/query", jobContractCors, jobContractSecurityHeaders, jobContractRateLimit, handleReadOnlyQuery);
+router.post("/query", jobContractCors, jobContractSecurityHeaders, jobContractRateLimit, handleReadOnlyQuery);
+
+// GET /api/jobs/whitelisted-tokens?contractId= – alias the frontend calls (#696).
+router.get("/whitelisted-tokens", (req: Request, res: Response) => {
+  const contractId = req.query.contractId;
+  if (typeof contractId !== "string" || !contractId.trim()) {
+    sendError(res, 400, "contractId is required");
+    return;
+  }
+  // Redirect relative to wherever this router is mounted (/api/jobs or
+  // /api/v1/jobs), not to the site root.
+  res.redirect(307, `${req.baseUrl}/${encodeURIComponent(contractId)}/whitelist`);
+});
+
 // GET /api/jobs/:contractId/history - event timeline for a single job
+
 router.get("/:contractId/history", (req: Request, res: Response) => {
   try {
     const contractId = req.params.contractId as string;
@@ -448,9 +671,115 @@ router.get("/:contractId/history", (req: Request, res: Response) => {
     const result = getEventsByContract(contractId, page, limit);
     res.json({ success: true, ...result });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    // Log the detail server-side only; never forward raw DB errors (#672).
+    logger.error("Failed to fetch job history", {
+      contractId: req.params.contractId,
+      error: err?.message,
+    });
+    sendError(res, 500, "Internal server error");
   }
 });
+
+// ---------------------------------------------------------------------------
+// GET /api/jobs/:contractId/fee-preview – simulate calculate_platform_fee_split
+// ---------------------------------------------------------------------------
+
+router.get(
+  "/:contractId/fee-preview",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  jobContractRateLimit,
+  validate(contractIdParamsSchema, "params", (req) =>
+    logger.warn("Invalid contractId provided", { contractId: req.params.contractId }),
+  ),
+  validate(feePreviewQuerySchema, "query", (req) =>
+    logger.warn("Invalid fee-preview query", { query: req.query }),
+  ),
+  async (req: Request, res: Response) => {
+    const contractId = req.params.contractId as string;
+    const { amount } = (req as RequestWithValidatedQuery)
+      .validatedQuery as FeePreviewQuery;
+    const cacheKey = `${contractId}:${amount}`;
+
+    // Check cache
+    const cached = feePreviewCache.get<Record<string, unknown>>(cacheKey);
+    if (cached !== undefined) {
+      logger.info("Fee preview served from cache", { contractId, amount });
+      sendSuccess(res, cached);
+      return;
+    }
+
+    let requestPromise = inFlightFeePreviewRequests.get(cacheKey) as
+      | Promise<Record<string, unknown>>
+      | undefined;
+    const servedFromInFlight = Boolean(requestPromise);
+
+    if (!requestPromise) {
+      requestPromise = (async (): Promise<Record<string, unknown>> => {
+        const contract = new Contract(contractId);
+        const account = await server.getAccount(
+          process.env.DEPLOYER_ADDRESS || "",
+        );
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            contract.call(
+              "calculate_platform_fee_split",
+              nativeToScVal(BigInt(amount), { type: "i128" }),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        // Read-only simulation only – never submits a transaction (#719).
+        const result = await server.simulateTransaction(tx);
+
+        if ("error" in result) {
+          const { status, message } = classifySimError(String(result.error));
+          throw new SimError(status, message);
+        }
+
+        if ("result" in result && result.result?.retval) {
+          const retval = scValToNative(result.result.retval);
+          const split = convertScValToNativeStrings(retval) as Record<
+            string,
+            unknown
+          >;
+          feePreviewCache.set(cacheKey, split);
+          return split;
+        }
+
+        throw new SimError(500, "Internal server error");
+      })();
+      inFlightFeePreviewRequests.set(cacheKey, requestPromise);
+    }
+
+    try {
+      const split = await requestPromise;
+      if (servedFromInFlight) {
+        logger.info("Fee preview served from in-flight cache", { contractId, amount });
+      }
+      sendSuccess(res, split);
+    } catch (err: any) {
+      // Failures are never cached; the client only sees a classified status
+      // and a fixed message, never the raw RPC error.
+      if (err instanceof SimError) {
+        sendError(res, err.status, err.message);
+        return;
+      }
+      logger.error("Failed to compute fee preview", {
+        contractId,
+        amount,
+        error: err?.message ?? String(err),
+      });
+      sendError(res, 500, "Internal server error");
+    } finally {
+      inFlightFeePreviewRequests.delete(cacheKey);
+    }
+  },
+);
 
 // GET /api/jobs/:contractId - get job state
 router.get(
@@ -466,15 +795,10 @@ router.get(
 
     logger.info("Fetching job", { contractId });
 
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized request", { contractId });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    // Deliberately unauthenticated, for the same reason as
+    // GET /by-wallet/:address above: this reads contract state that anyone can
+    // simulate against the public RPC themselves. Rate limited at nginx via
+    // zone=api_public_read rather than by a key the browser would have to ship.
 
     try {
       const contract = new Contract(contractId);
@@ -537,23 +861,18 @@ router.get(
     logger.info("Fetching whitelisted tokens", { contractId: req.params.contractId });
     next();
   },
-  validate(contractIdParamsSchema, "params", (req) =>
+  validate(whitelistParamsSchema, "params", (req) =>
     logger.warn("Invalid contractId provided", { contractId: req.params.contractId }),
   ),
   async (req: Request, res: Response) => {
     const contractId = req.params.contractId as string;
 
     try {
-      // Check API key authorization
-      const requiredApiKey = process.env.API_KEY;
-      if (requiredApiKey) {
-        const providedKey = req.header("x-api-key");
-        if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { contractId });
-          sendError(res, 401, "Unauthorized");
-          return;
-        }
-      }
+      // Deliberately unauthenticated, for the same reason as GET /by-wallet
+      // and GET /:contractId: reads on-chain state that anyone can simulate
+      // against the public RPC themselves. The whitelist is a public list of
+      // accepted token addresses; the browser cannot hold a secret. Rate
+      // limited via the route limiter rather than a key. (#693)
 
       // Check cache
       const cached = whitelistCache.get<string[]>(contractId);
@@ -667,135 +986,51 @@ router.get(
 );
 
 // ---------------------------------------------------------------------------
-// POST /api/jobs/:contractId/whitelist/update – update token whitelist status
+// POST /api/jobs/:contractId/whitelist/update – update whitelisted tokens
 // ---------------------------------------------------------------------------
 router.post(
   "/:contractId/whitelist/update",
   jobContractCors,
   jobContractSecurityHeaders,
-  jobWhitelistRateLimit,
+  whitelistUpdateRateLimit,
   validate(contractIdParamsSchema, "params", (req) =>
-    logger.warn("Invalid params for whitelist/update", { params: req.params }),
+    logger.warn("Invalid contractId provided for whitelist update", { contractId: req.params.contractId }),
   ),
-  validate(whitelistUpdateBodySchema, "body", (req) =>
-    logger.warn("Invalid body for whitelist/update", { body: req.body }),
+  validate(whitelistUpdateRequestSchema, "body", (req) =>
+    logger.warn("Invalid body provided for whitelist update", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
     const contractId = req.params.contractId as string;
-    const { token, action, sourceAddress } = req.body as {
-      token: string;
-      action: "add" | "remove";
-      sourceAddress: string;
-    };
-    const cacheKey = `${contractId}:${action}:${token}:${sourceAddress}`;
-    const traceId = randomUUID();
-    const pathVars = { contractId, token, action, sourceAddress };
+    const body = req.body as WhitelistUpdateRequestBody;
+    const { addresses, tokens } = body as UpdateWhitelistBody;
+    const { token, action, adminAddress } = body as WhitelistUpdateBody;
+    // Bulk form supplies addresses/tokens; the single-token form supplies one.
+    const isSingleTokenForm = token !== undefined;
+    const targetAddresses = addresses ?? tokens ?? (token ? [token] : []);
 
-    logger.debug("Whitelist update handler entered", {
-      traceId,
-      ...pathVars,
-      params: req.params,
-      bodyKeys: Object.keys(req.body ?? {}),
-    });
+    logger.info("Updating whitelist", { contractId, count: targetAddresses.length });
 
-    logger.info("Whitelist update request received", {
-      traceId,
-      ...pathVars,
-    });
+    // Deliberately unauthenticated: this route only builds an unsigned XDR
+    // that the caller's own wallet must sign. The key protected nothing the
+    // signature doesn't already protect. Rate limited via the route limiter
+    // rather than a key. (#693)
 
-    try {
-      const requiredApiKey = process.env.API_KEY;
-      if (requiredApiKey) {
-        const providedKey = req.header("x-api-key");
-        if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { traceId, ...pathVars });
-          sendError(res, 401, "Unauthorized");
-          return;
-        }
-      }
+    // The single-token form (`{ token, action, adminAddress }`) builds and
+    // returns an unsigned transaction for the caller to sign, rather than
+    // verifying the contract and echoing the address list back like the bulk
+    // form below does.
+    if (isSingleTokenForm) {
+      logger.info("Processing whitelist update", { contractId, token, action });
 
-      logger.debug("Checking whitelist update cache", { traceId, ...pathVars, cacheKey });
-      const cached = whitelistUpdateCache.get<string>(cacheKey);
-      if (cached !== undefined) {
-        logger.info("Whitelist update XDR served from cache", {
-          traceId,
-          ...pathVars,
-          source: "cache",
-          xdrLength: cached.length,
-        });
-        const responseBody = { success: true, xdr: cached };
-        logger.debug("Whitelist update response body prepared", {
-          traceId,
-          ...pathVars,
-          success: responseBody.success,
-          xdrLength: responseBody.xdr.length,
-        });
-        logger.info("Whitelist update response sent", {
-          traceId,
-          ...pathVars,
-          status: 200,
-          success: true,
-          cached: true,
-          xdrLength: cached.length,
-        });
-        res.json(responseBody);
-        return;
-      }
-
-      logger.debug("Checking in-flight whitelist update requests", {
-        traceId,
-        ...pathVars,
-        cacheKey,
-      });
-      const inFlight = inFlightWhitelistUpdateRequests.get(cacheKey);
-      if (inFlight) {
-        const xdr = await inFlight;
-        logger.info("Whitelist update XDR served from in-flight cache", {
-          traceId,
-          ...pathVars,
-          source: "in-flight",
-          xdrLength: xdr.length,
-        });
-        const responseBody = { success: true, xdr };
-        logger.debug("Whitelist update response body prepared", {
-          traceId,
-          ...pathVars,
-          success: responseBody.success,
-          xdrLength: responseBody.xdr.length,
-        });
-        logger.info("Whitelist update response sent", {
-          traceId,
-          ...pathVars,
-          status: 200,
-          success: true,
-          cached: true,
-          inFlight: true,
-          xdrLength: xdr.length,
-        });
-        res.json(responseBody);
-        return;
-      }
-
-      logger.info("Fetching whitelist update XDR from Stellar RPC", {
-        traceId,
-        ...pathVars,
-      });
-
-      const method =
-        action === "add" ? "add_whitelisted_token" : "remove_whitelisted_token";
-
-      const requestPromise = (async (): Promise<string> => {
-        logger.debug("Building Stellar transaction for whitelist update", {
-          traceId,
-          ...pathVars,
-          method,
-          fee: BASE_FEE,
-          timeout: 30,
-        });
+      try {
         const contract = new Contract(contractId);
-        logger.debug("Fetching Stellar account", { traceId, ...pathVars });
-        const account = await server.getAccount(sourceAddress);
-        logger.debug("Stellar account fetched", { traceId, ...pathVars });
+        const account = await server.getAccount(
+          adminAddress || process.env.DEPLOYER_ADDRESS || "",
+        );
+        const method =
+          action === "remove"
+            ? "remove_whitelisted_token"
+            : "add_whitelisted_token";
 
         const tx = new TransactionBuilder(account, {
           fee: BASE_FEE,
@@ -804,101 +1039,88 @@ router.post(
           .addOperation(
             contract.call(
               method,
-              Address.fromString(sourceAddress).toScVal(),
-              Address.fromString(token).toScVal(),
+              new Address(adminAddress).toScVal(),
+              new Address(token).toScVal(),
             ),
           )
           .setTimeout(30)
           .build();
 
-        logger.debug("Calling prepareTransaction on Stellar RPC", {
-          traceId,
-          ...pathVars,
-        });
         const prepared = await server.prepareTransaction(tx);
         const xdr = prepared.toXDR();
-        logger.debug("Storing whitelist update XDR in cache", {
-          traceId,
-          ...pathVars,
-          cacheKey,
-          xdrLength: xdr.length,
-          ttlSeconds: WHITELIST_UPDATE_TTL,
-        });
-        whitelistUpdateCache.set(cacheKey, xdr);
-        return xdr;
-      })();
 
-      inFlightWhitelistUpdateRequests.set(cacheKey, requestPromise);
-      logger.debug("In-flight promise registered", { traceId, ...pathVars, cacheKey });
-      let xdr: string;
-      try {
-        xdr = await requestPromise;
+        whitelistCache.del(contractId);
+        logger.info("Whitelist update transaction built", { contractId, token, action });
+        sendSuccess(res, { xdr });
+        return;
       } catch (err: any) {
-        logger.debug("RPC promise rejected, clearing cache entry", {
-          traceId,
-          ...pathVars,
-          cacheKey,
-          error: err?.message ?? String(err),
-        });
-        whitelistUpdateCache.del(cacheKey);
-        throw err;
-      } finally {
-        inFlightWhitelistUpdateRequests.delete(cacheKey);
-        logger.debug("In-flight promise unregistered", { traceId, ...pathVars, cacheKey });
+        const message = err?.message ?? String(err);
+        if (/unauthorized|invalid authentication/i.test(message)) {
+          logger.warn("Unauthorized request for whitelist update", { contractId });
+          sendError(res, 401, "Unauthorized");
+          return;
+        }
+        if (/not found/i.test(message) && !/account not found/i.test(message)) {
+          logger.warn("Job not found for whitelist update", { contractId });
+          sendError(res, 404, "Job not found");
+          return;
+        }
+        logger.error("Failed to update whitelist", { contractId, error: message });
+        sendError(res, 500, "Internal server error");
+        return;
+      }
+    }
+
+    try {
+      const contract = new Contract(contractId);
+      const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call("get_whitelisted_tokens"))
+        .setTimeout(30)
+        .build();
+
+      const result = await server.simulateTransaction(tx);
+
+      if ("error" in result) {
+        const errorMsg = String(result.error);
+        if (
+          !errorMsg.includes("contract error #2") &&
+          !errorMsg.includes("NotInitialized")
+        ) {
+          if (
+            /not found|NotFound|contract not found/i.test(errorMsg) ||
+            /contract error #1\b/i.test(errorMsg)
+          ) {
+            logger.warn("Job not found for whitelist update", { contractId });
+            sendError(res, 404, "Job not found");
+            return;
+          }
+          logger.error("Failed to verify contract for whitelist update", { contractId, error: errorMsg });
+          sendError(res, 500, "Internal server error");
+          return;
+        }
       }
 
-      logger.info("Whitelist update XDR built successfully", {
-        traceId,
-        ...pathVars,
-        xdrLength: xdr.length,
-      });
-      const responseBody = { success: true, xdr };
-      logger.debug("Whitelist update response body prepared", {
-        traceId,
-        ...pathVars,
-        success: responseBody.success,
-        xdrLength: responseBody.xdr.length,
-      });
-      logger.info("Whitelist update response sent", {
-        traceId,
-        ...pathVars,
-        status: 200,
-        success: true,
-        cached: false,
-        xdrLength: xdr.length,
-      });
-
-      res.json(responseBody);
+      whitelistCache.del(contractId);
+      logger.info("Whitelist updated successfully", { contractId, count: targetAddresses.length });
+      sendSuccess(res, { contractId, addresses: targetAddresses, updated: true });
     } catch (err: any) {
       const message = err?.message ?? String(err);
-      const stack = err?.stack;
-      logger.debug("Whitelist update error caught", {
-        traceId,
-        ...pathVars,
-        error: message,
-        stack,
-      });
-      logger.error("Failed to build whitelist update tx", {
-        traceId,
-        ...pathVars,
-        error: message,
-        stack,
-      });
-      const responseBody = { success: false, error: "Internal server error" };
-      logger.debug("Whitelist update error response body prepared", {
-        traceId,
-        ...pathVars,
-        success: responseBody.success,
-        clientError: responseBody.error,
-      });
-      logger.info("Whitelist update response sent", {
-        traceId,
-        ...pathVars,
-        status: 500,
-        success: false,
-        error: message,
-      });
-      res.status(500).json(responseBody);
+      if (/unauthorized|invalid authentication/i.test(message)) {
+        logger.warn("Unauthorized request for whitelist update", { contractId });
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+      if (/not found/i.test(message) && !/account not found/i.test(message)) {
+        logger.warn("Job not found for whitelist update", { contractId });
+        sendError(res, 404, "Job not found");
+        return;
+      }
+      logger.error("Failed to update whitelist", { contractId, error: message });
+      sendError(res, 500, "Internal server error");
     }
   },
 );
@@ -908,6 +1130,8 @@ router.post(
 // ---------------------------------------------------------------------------
 router.post(
   "/build-tx",
+  buildTxCors,
+  buildTxSecurityHeaders,
   // buildTxRateLimit supersedes the generic strictLimiter for this route.
   buildTxRateLimit,
   // Schema validation for POST /api/jobs/build-tx payload
@@ -915,9 +1139,24 @@ router.post(
     logger.warn("Invalid build-tx request body", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
-    try {
-      const { contractId, method, args, sourceAddress } = req.body;
+    const { contractId, method, args, sourceAddress } = req.body;
+    const traceId = randomUUID();
+    const pathVars = { contractId, method, sourceAddress };
 
+    logger.debug("Build-tx handler entered", {
+      traceId,
+      ...pathVars,
+      params: req.params,
+      bodyKeys: Object.keys(req.body ?? {}),
+      argCount: (args || []).length,
+    });
+
+    logger.info("Build-tx request received", {
+      traceId,
+      ...pathVars,
+    });
+
+    try {
       // Validate for whitelist management methods
       if (method === "add_whitelisted_token" || method === "remove_whitelisted_token") {
         const adminArg = args.find((a: any) => a.type === "address" && a.value);
@@ -925,8 +1164,22 @@ router.post(
 
         if (!adminArg || !tokenArg) {
           logger.warn("Missing admin/token args for whitelist management", {
-            contractId,
-            method,
+            traceId,
+            ...pathVars,
+          });
+          logger.debug("Build-tx error response body prepared", {
+            traceId,
+            ...pathVars,
+            success: false,
+            clientError:
+              "Both admin (address) and token (address) arguments are required for whitelist management methods",
+          });
+          logger.info("Build-tx response sent", {
+            traceId,
+            ...pathVars,
+            status: 400,
+            success: false,
+            error: "whitelist management args validation",
           });
           sendError(
             res,
@@ -939,9 +1192,29 @@ router.post(
 
       const cacheKey = buildTxCacheKey(contractId, method, sourceAddress, args || []);
 
+      logger.debug("Checking build-tx cache", { traceId, ...pathVars, cacheKey });
       const cached = buildTxCache.get<string>(cacheKey);
       if (cached !== undefined) {
-        logger.info("Build-tx XDR served from cache", { contractId, method });
+        logger.info("Build-tx XDR served from cache", {
+          traceId,
+          ...pathVars,
+          source: "cache",
+          xdrLength: cached.length,
+        });
+        logger.debug("Build-tx response body prepared", {
+          traceId,
+          ...pathVars,
+          success: true,
+          xdrLength: cached.length,
+        });
+        logger.info("Build-tx response sent", {
+          traceId,
+          ...pathVars,
+          status: 200,
+          success: true,
+          cached: true,
+          xdrLength: cached.length,
+        });
         res.json({ success: true, xdr: cached });
         return;
       }
@@ -949,10 +1222,36 @@ router.post(
       let requestPromise = inFlightBuildTxRequests.get(cacheKey);
       const servedFromInFlight = Boolean(requestPromise);
 
+      logger.debug("Checking in-flight build-tx requests", {
+        traceId,
+        ...pathVars,
+        cacheKey,
+      });
+
       if (!requestPromise) {
         requestPromise = (async (): Promise<string> => {
+          logger.info("Fetching build-tx XDR from Stellar RPC", {
+            traceId,
+            ...pathVars,
+          });
+
+          logger.debug("Building Stellar transaction for build-tx", {
+            traceId,
+            ...pathVars,
+            method,
+            fee: BASE_FEE,
+            timeout: 30,
+          });
           const contract = new Contract(contractId as string);
+          logger.debug("Fetching Stellar account for build-tx", {
+            traceId,
+            ...pathVars,
+          });
           const account = await server.getAccount(sourceAddress as string);
+          logger.debug("Stellar account fetched for build-tx", {
+            traceId,
+            ...pathVars,
+          });
 
           const scArgs = (args || []).map((a: any) => {
             if (a.type === "address") return Address.fromString(a.value).toScVal();
@@ -980,31 +1279,110 @@ router.post(
             .setTimeout(30)
             .build();
 
+          logger.debug("Calling prepareTransaction on Stellar RPC for build-tx", {
+            traceId,
+            ...pathVars,
+          });
           const prepared = await server.prepareTransaction(tx);
           const xdr = prepared.toXDR();
+          logger.debug("Storing build-tx XDR in cache", {
+            traceId,
+            ...pathVars,
+            cacheKey,
+            xdrLength: xdr.length,
+            ttlSeconds: BUILD_TX_CACHE_TTL,
+          });
           buildTxCache.set(cacheKey, xdr);
           return xdr;
         })();
 
         inFlightBuildTxRequests.set(cacheKey, requestPromise);
+        logger.debug("In-flight build-tx promise registered", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+        });
       }
 
       let xdr: string;
       try {
         xdr = await requestPromise;
       } catch (err: any) {
+        logger.debug("RPC promise rejected for build-tx, clearing cache entry", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+          error: err?.message ?? String(err),
+        });
         buildTxCache.del(cacheKey);
         throw err;
       } finally {
         inFlightBuildTxRequests.delete(cacheKey);
+        logger.debug("In-flight build-tx promise unregistered", {
+          traceId,
+          ...pathVars,
+          cacheKey,
+        });
       }
 
       if (servedFromInFlight) {
-        logger.info("Build-tx XDR served from in-flight cache", { contractId, method });
+        logger.info("Build-tx XDR served from in-flight cache", {
+          traceId,
+          ...pathVars,
+          source: "in-flight",
+          xdrLength: xdr.length,
+        });
       }
+
+      logger.info("Build-tx XDR built successfully", {
+        traceId,
+        ...pathVars,
+        xdrLength: xdr.length,
+      });
+      logger.debug("Build-tx response body prepared", {
+        traceId,
+        ...pathVars,
+        success: true,
+        xdrLength: xdr.length,
+      });
+      logger.info("Build-tx response sent", {
+        traceId,
+        ...pathVars,
+        status: 200,
+        success: true,
+        cached: false,
+        xdrLength: xdr.length,
+      });
+
       res.json({ success: true, xdr });
     } catch (err: any) {
-      logger.error("Failed to build transaction", { error: err?.message });
+      const message = err?.message ?? String(err);
+      const stack = err?.stack;
+      logger.debug("Build-tx error caught", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      logger.error("Failed to build build-tx transaction", {
+        traceId,
+        ...pathVars,
+        error: message,
+        stack,
+      });
+      logger.debug("Build-tx error response body prepared", {
+        traceId,
+        ...pathVars,
+        success: false,
+        clientError: "Internal server error",
+      });
+      logger.info("Build-tx response sent", {
+        traceId,
+        ...pathVars,
+        status: 500,
+        success: false,
+        error: message,
+      });
       sendError(res, 500, "Internal server error");
     }
   },
@@ -1013,39 +1391,48 @@ router.post(
 // ---------------------------------------------------------------------------
 // POST /api/jobs/:contractId/milestones/:index/partial-release
 // ---------------------------------------------------------------------------
+router.options(
+  "/:contractId/milestones/:index/partial-release",
+  partialReleaseCors,
+);
+
 router.post(
   "/:contractId/milestones/:index/partial-release",
+  partialReleaseCors,
+  partialReleaseSecurityHeaders,
   partialReleaseRateLimit,
-  validate(contractMilestoneParamsSchema, "params", (req) =>
+  validateWithFields(contractMilestoneParamsSchema, "params", (req) =>
     logger.warn("Invalid params for partial-release", { params: req.params }),
   ),
-  validate(partialReleaseBodySchema, "body", (req) =>
+  validateWithFields(partialReleaseBodySchema, "body", (req) =>
     logger.warn("Invalid body for partial-release", { body: req.body }),
   ),
   async (req: Request, res: Response) => {
+    const traceId = randomUUID();
     try {
       const { contractId, index } = req.params;
 
-      const requiredApiKey = process.env.API_KEY;
-      if (requiredApiKey) {
-        const providedKey = req.header("x-api-key");
-        if (providedKey !== requiredApiKey) {
-          logger.warn("Unauthorized request", { contractId });
-          sendError(res, 401, "Unauthorized");
-          return;
-        }
-      }
+      // Deliberately unauthenticated: this route only builds an unsigned XDR
+      // for approve_partial that the caller's own wallet must sign. The key
+      // protected nothing the signature doesn't already protect. Rate limited
+      // via the route limiter rather than a key. (#693)
 
       const { amount, sourceAddress } = req.body;
 
+      logger.debug("Partial-release handler entered", {
+        traceId,
+        contractId,
+        index,
+        ip: req.ip ?? req.socket?.remoteAddress,
+      });
+
       logger.info("Processing partial-release", {
+        traceId,
         contractId,
         index,
         amount,
         sourceAddress,
       });
-
-      const contract = new Contract(contractId as string);
 
       let account;
       try {
@@ -1053,41 +1440,113 @@ router.post(
       } catch (err: any) {
         const errMsg = String(err?.message || err);
         const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to get account for partial release", { sourceAddress, error: errMsg });
+        logger.error("Failed to get account for partial release", {
+          traceId,
+          contractId,
+          index,
+          sourceAddress,
+          error: errMsg,
+          stack: err?.stack,
+        });
         sendError(res, status, message);
         return;
       }
 
-      const amountNum = BigInt(amount);
+      const cacheKey = partialReleaseCacheKey(
+        contractId as string,
+        index as string,
+        amount,
+        sourceAddress,
+      );
 
-      const tx = new TransactionBuilder(account, {
-        fee: BASE_FEE,
-        networkPassphrase: NETWORK_PASSPHRASE,
-      })
-        .addOperation(contract.call(
-          "approve_partial",
-          Address.fromString(sourceAddress).toScVal(),
-          nativeToScVal(Number(index), { type: "u32" }),
-          nativeToScVal(amountNum, { type: "i128" })
-        ))
-        .setTimeout(30)
-        .build();
+      logger.debug("Checking partial-release cache", { traceId, contractId, index, cacheKey });
+      const cachedXdr = partialReleaseCache.get<string>(cacheKey);
+      if (cachedXdr !== undefined) {
+        logger.info("Partial-release XDR served from cache", {
+          traceId,
+          contractId,
+          index,
+          source: "cache",
+          xdrLength: cachedXdr.length,
+        });
+        res.json({ success: true, xdr: cachedXdr });
+        return;
+      }
 
-      let prepared;
+      let requestPromise = inFlightPartialReleaseRequests.get(cacheKey);
+      const servedFromInFlight = Boolean(requestPromise);
+
+      if (!requestPromise) {
+        requestPromise = (async (): Promise<string> => {
+          const contract = new Contract(contractId as string);
+          const amountNum = BigInt(amount);
+
+          const tx = new TransactionBuilder(account, {
+            fee: BASE_FEE,
+            networkPassphrase: NETWORK_PASSPHRASE,
+          })
+            .addOperation(contract.call(
+              "approve_partial",
+              Address.fromString(sourceAddress).toScVal(),
+              nativeToScVal(Number(index), { type: "u32" }),
+              nativeToScVal(amountNum, { type: "i128" })
+            ))
+            .setTimeout(30)
+            .build();
+
+          let prepared;
+          try {
+            prepared = await server.prepareTransaction(tx);
+          } catch (err: any) {
+            const errMsg = String(err?.message || err);
+            const { status, message } = classifySimError(errMsg);
+            logger.error("Failed to prepare transaction for partial release", {
+              traceId,
+              contractId,
+              index,
+              error: errMsg,
+            });
+            throw { status, message };
+          }
+
+          const xdr = prepared.toXDR();
+          partialReleaseCache.set(cacheKey, xdr);
+          return xdr;
+        })();
+
+        inFlightPartialReleaseRequests.set(cacheKey, requestPromise);
+      }
+
+      let xdr: string;
       try {
-        prepared = await server.prepareTransaction(tx);
+        xdr = await requestPromise;
       } catch (err: any) {
-        const errMsg = String(err?.message || err);
-        const { status, message } = classifySimError(errMsg);
-        logger.error("Failed to prepare transaction for partial release", { contractId, error: errMsg });
-        sendError(res, status, message);
-        return;
+        partialReleaseCache.del(cacheKey);
+        if (err && err.status) {
+          sendError(res, err.status, err.message);
+          return;
+        }
+        throw err;
+      } finally {
+        inFlightPartialReleaseRequests.delete(cacheKey);
       }
 
-      res.json({ success: true, xdr: prepared.toXDR() });
+      if (servedFromInFlight) {
+        logger.info("Partial-release XDR served from in-flight cache", { contractId, index });
+      }
+
+      res.json({ success: true, xdr });
     } catch (err: any) {
       const errMsg = String(err?.message || err);
-      logger.error("Unexpected error in partial release", { error: errMsg });
+      // Structured, server-side-only error detail – the client receives a clean
+      // 500 body with no internal stack trace leakage (#117).
+      logger.error("Unexpected error in partial release", {
+        traceId,
+        contractId: req.params.contractId,
+        index: req.params.index,
+        error: errMsg,
+        stack: err?.stack,
+      });
       sendError(res, 500, "Internal server error");
     }
   }
@@ -1098,7 +1557,10 @@ router.post(
 // Validates route parameters using contractMilestoneParamsSchema.
 // ---------------------------------------------------------------------------
 router.get(
-  "/:contractId/milestones/:index/time-remaining",
+  [
+    "/:contractId/milestones/:index/time-remaining",
+    "/:contractId/milestones/:index/auto-release",
+  ],
   timeRemainingCors,
   timeRemainingSecurityHeaders,
   timeRemainingRateLimit,
@@ -1109,15 +1571,9 @@ router.get(
     const contractId = req.params.contractId as string;
     const { index } = req.params;
 
-    const requiredApiKey = process.env.API_KEY;
-    if (requiredApiKey) {
-      const providedKey = req.header("x-api-key");
-      if (providedKey !== requiredApiKey) {
-        logger.warn("Unauthorized request", { contractId, index });
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
-    }
+    // Deliberately unauthenticated: reads on-chain state (time_until_auto_release)
+    // that anyone can simulate against the public RPC themselves. Rate limited
+    // via the route limiter rather than a key. (#693)
 
     const cacheKey = `${contractId}:${index}`;
 

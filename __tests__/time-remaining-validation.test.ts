@@ -1,6 +1,7 @@
 import { jest } from "@jest/globals";
 import request from "supertest";
 import express from "express";
+import { autoAuth, TEST_API_KEY } from "./helpers/api-key-helper.js";
 
 const VALID_CONTRACT = "CDD5WKK3WT3QVKXMXTJNDIXE4T73FK6GGXDSD6UTJAH6YYZU52SQ4MUH";
 
@@ -14,7 +15,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
   },
 }));
 
-const { default: router } = await import("../src/routes/jobs.js");
+const { default: router, resetTimeRemainingCache } = await import("../src/routes/jobs.js");
 const { resetTimeRemainingRateLimitBuckets } = await import(
   "../src/middleware/job-contract-rate-limit.js"
 );
@@ -22,6 +23,7 @@ const { resetTimeRemainingRateLimitBuckets } = await import(
 function buildApp() {
   const app = express();
   app.use(express.json());
+  app.use(autoAuth);
   app.use("/api/jobs", router);
   return app;
 }
@@ -53,6 +55,21 @@ describe("GET /api/jobs/:contractId/milestones/:index/time-remaining", () => {
 
     expect(res.body).toEqual({ success: true, data: { secondsRemaining: 120 } });
     expect(mockGetAccount).toHaveBeenCalled();
+    expect(mockSimulateTransaction).toHaveBeenCalled();
+  });
+
+  // Public on-chain read: no API key is required, even when none is
+  // configured, because a browser cannot hold one (#693).
+  it("returns 200 without an API key when API_KEY is not set", async () => {
+    resetTimeRemainingCache();
+    delete process.env.API_KEY;
+    mockSimulateTransaction.mockResolvedValue({ result: { retval: 120 } });
+
+    const res = await request(buildApp())
+      .get(`/api/jobs/${VALID_CONTRACT}/milestones/0/time-remaining`)
+      .expect(200);
+
+    expect(res.body).toEqual({ success: true, data: { secondsRemaining: 120 } });
     expect(mockSimulateTransaction).toHaveBeenCalled();
   });
 

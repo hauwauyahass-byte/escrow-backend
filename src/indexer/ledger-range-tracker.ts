@@ -1,5 +1,223 @@
 import { getDb, getLastIndexedLedger, insertEvent, type EventRow } from "./db.js";
 import logger from "../utils/logger.js";
+import { FailureMonitor } from "./failure-monitor.js";
+
+// ---------------------------------------------------------------------------
+// RPC retry backoff for ledger-range-tracker (#Task1)
+// ---------------------------------------------------------------------------
+// The tracker's fetchEvents callback may invoke an RPC endpoint that suffers
+// transient timeouts or connection resets.  Rather than propagating the first
+// error immediately, the tracker applies an exponential-backoff retry so
+// short-lived connectivity problems are recovered from automatically.
+
+export interface LedgerRangeRpcRetryConfig {
+  /** Maximum number of retry attempts per fetchEvents call (default: 5). */
+  maxRetries: number;
+  /** Delay in ms after the first failure (default: 200). */
+  initialBackoffMs: number;
+  /** Multiplier applied on every subsequent failure (default: 2). */
+  backoffMultiplier: number;
+  /** Upper ceiling on the delay in ms (default: 10 000). */
+  maxBackoffMs: number;
+}
+
+export const DEFAULT_LEDGER_RANGE_RPC_RETRY_CONFIG: LedgerRangeRpcRetryConfig = {
+  maxRetries: 5,
+  initialBackoffMs: 200,
+  backoffMultiplier: 2,
+  maxBackoffMs: 10_000,
+};
+
+/** Error patterns that represent transient RPC/network failures worth retrying. */
+const RPC_RETRYABLE_PATTERNS = [
+  "timeout",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "socket hang up",
+  "network",
+  "status 429",
+  "status 503",
+  "status 502",
+  "request timeout",
+  "connect timeout",
+  "connection reset",
+  "connection refused",
+  "connection dropped",
+];
+
+export function isLedgerRangeRpcRetryable(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return RPC_RETRYABLE_PATTERNS.some((p) => msg.includes(p.toLowerCase()));
+}
+
+/**
+ * Compute the delay in ms for a given retry attempt using exponential backoff.
+ * attempt 0 → initialBackoffMs
+ * attempt 1 → initialBackoffMs × multiplier
+ * …, capped at maxBackoffMs.
+ */
+export function computeLedgerRangeRpcBackoffMs(
+  attempt: number,
+  config: Pick<
+    LedgerRangeRpcRetryConfig,
+    "initialBackoffMs" | "backoffMultiplier" | "maxBackoffMs"
+  >,
+): number {
+  return Math.min(
+    config.initialBackoffMs * Math.pow(config.backoffMultiplier, attempt),
+    config.maxBackoffMs,
+  );
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute an async operation with exponential backoff retry, retrying only on
+ * transient RPC/network errors.  Non-retryable errors are re-thrown immediately.
+ */
+export async function withLedgerRangeRpcRetry<T>(
+  fn: () => Promise<T>,
+  config: Partial<LedgerRangeRpcRetryConfig> = {},
+  context = "ledger_range_tracker_rpc",
+): Promise<T> {
+  const cfg = { ...DEFAULT_LEDGER_RANGE_RPC_RETRY_CONFIG, ...config };
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= cfg.maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (!isLedgerRangeRpcRetryable(lastError) || attempt >= cfg.maxRetries) {
+        throw lastError;
+      }
+
+      const delay = computeLedgerRangeRpcBackoffMs(attempt, cfg);
+      logger.warn(`${context} failed, retrying with backoff`, {
+        attempt: attempt + 1,
+        maxRetries: cfg.maxRetries,
+        backoffMs: delay,
+        error: lastError.message,
+      });
+      await sleepMs(delay);
+    }
+  }
+
+  throw lastError ?? new Error(`${context} exhausted all retries`);
+}
+
+// ---------------------------------------------------------------------------
+// Schema verification (#259)
+// ---------------------------------------------------------------------------
+// The tracker reads and writes `events` and `indexer_state` directly. Starting
+// it against a half-migrated database silently mis-tracks ledger progress, so
+// callers verify the schema before the tracker is allowed to run.
+
+/** Tables and columns the tracker's statements depend on. */
+const LEDGER_RANGE_REQUIRED_SCHEMA: Record<string, string[]> = {
+  events: ["contract_id", "event_type", "ledger_sequence", "data_json"],
+  indexer_state: ["key", "value"],
+};
+
+export interface LedgerRangeSchemaReport {
+  valid: boolean;
+  missingTables: string[];
+  missingColumns: Record<string, string[]>;
+  errors: string[];
+}
+
+/**
+ * Check every table and column the tracker needs, reporting all problems at
+ * once rather than failing on the first.
+ */
+export function verifyLedgerRangeTrackerSchema(): LedgerRangeSchemaReport {
+  const database = getDb();
+  const missingTables: string[] = [];
+  const missingColumns: Record<string, string[]> = {};
+  const errors: string[] = [];
+
+  for (const [table, requiredColumns] of Object.entries(
+    LEDGER_RANGE_REQUIRED_SCHEMA,
+  )) {
+    const exists = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+      .get(table);
+
+    if (!exists) {
+      missingTables.push(table);
+      errors.push(`missing table: ${table}`);
+      continue;
+    }
+
+    const columns = (
+      database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+        name: string;
+      }>
+    ).map((c) => c.name);
+
+    const absent = requiredColumns.filter((c) => !columns.includes(c));
+    if (absent.length > 0) {
+      missingColumns[table] = absent;
+      errors.push(`missing columns in ${table}: ${absent.join(", ")}`);
+    }
+  }
+
+  // A hole in the applied migration versions means some migrations ran and
+  // others did not — the tracker's tables may exist but be the wrong shape.
+  if (!missingTables.includes("schema_migrations")) {
+    try {
+      const applied = (
+        database
+          .prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all() as Array<{ version: number }>
+      ).map((r) => r.version);
+
+      if (applied.length > 0) {
+        const gaps: number[] = [];
+        for (let v = applied[0]; v < applied[applied.length - 1]; v++) {
+          if (!applied.includes(v)) gaps.push(v);
+        }
+        if (gaps.length > 0) {
+          errors.push(
+            `migration version gap – missing applied migrations: ${gaps.join(", ")}`,
+          );
+        }
+      }
+    } catch {
+      // schema_migrations exists but is unreadable; the table checks above
+      // already describe the damage.
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    missingTables,
+    missingColumns,
+    errors,
+  };
+}
+
+/** Throw unless the tracker's schema dependencies are all satisfied. */
+export function assertLedgerRangeTrackerSchemaValid(): void {
+  const report = verifyLedgerRangeTrackerSchema();
+  if (report.valid) return;
+
+  logger.error("LedgerRangeTracker schema verification failed", {
+    missingTables: report.missingTables,
+    missingColumns: report.missingColumns,
+    errors: report.errors,
+  });
+
+  throw new Error(
+    `LedgerRangeTracker schema verification failed – the tracker cannot start: ` +
+      report.errors.join("; "),
+  );
+}
 
 /**
  * LedgerRangeTracker manages ledger range operations with full transaction support.
@@ -249,6 +467,8 @@ export interface LedgerRangeTrackerConfig {
   failureThreshold?: number;
   /** Elapsed ms since last success after which a stall is reported. */
   stallThresholdMs?: number;
+  /** RPC retry backoff configuration for transient fetchEvents failures. */
+  rpcRetryConfig?: Partial<LedgerRangeRpcRetryConfig>;
 }
 
 export interface ProcessLedgerRangeOptions {
@@ -570,13 +790,8 @@ export function resetLedgerRangeLocks(): void {
 // Consecutive failure / stall alerting (#298)
 // ---------------------------------------------------------------------------
 
-export class LedgerRangeFailureMonitor {
+export class LedgerRangeFailureMonitor extends FailureMonitor {
   readonly tracker: string;
-  readonly failureThreshold: number;
-  readonly stallThresholdMs: number;
-  private consecutiveFailures = 0;
-  private lastSuccessfulAt: number | null = null;
-  private alertActive = false;
 
   constructor(
     options: {
@@ -586,73 +801,50 @@ export class LedgerRangeFailureMonitor {
     } = {}
   ) {
     const env = safeEnvConfig();
-    this.tracker = options.name ?? TRACKER_NAME;
-    this.failureThreshold = options.failureThreshold ?? env.failureThreshold;
-    this.stallThresholdMs = options.stallThresholdMs ?? env.stallThresholdMs;
+    super({
+      name: options.name ?? TRACKER_NAME,
+      logComponent: TRACKER_NAME,
+      payloadKey: "tracker",
+      failureThreshold: options.failureThreshold ?? env.failureThreshold,
+      stallThresholdMs: options.stallThresholdMs ?? env.stallThresholdMs,
+      onError: (_failureType, payload) => {
+        logger.error("ledger_range_tracker operation failed", payload);
+      },
+      onAlert: (payload) => {
+        logger.warn(
+          "ledger_range_tracker alert: consecutive failure threshold reached",
+          {
+            ...payload,
+            action:
+              "Inspect RPC connectivity, indexer writes, and stall diagnostics; the tracker resumes automatically after the next successful operation.",
+          },
+        );
+      },
+      onRecovery: (hadFailures) => {
+        if (hadFailures) {
+          logger.info("ledger_range_tracker recovered after consecutive failures", {
+            tracker: this.name,
+          });
+        }
+      },
+    });
+    this.tracker = this.name;
   }
 
   getConsecutiveFailures(): number {
-    return this.consecutiveFailures;
+    return super.getConsecutiveFailures();
   }
 
   getLastSuccessfulAt(): number | null {
-    return this.lastSuccessfulAt;
+    return super.getLastSuccessfulAt();
   }
 
   isAlertActive(): boolean {
-    return this.alertActive;
+    return super.isAlertActive();
   }
 
-  /**
-   * Record a failure. Emits a diagnostic error on every attempt and a warning
-   * alert only when the consecutive-failure threshold is first reached.
-   */
-  recordFailure(
-    failureType: LedgerRangeFailureType,
-    details: {
-      error?: string;
-      startLedger?: number;
-      endLedger?: number;
-    } = {}
-  ): number {
-    this.consecutiveFailures += 1;
-    const payload = {
-      tracker: this.tracker,
-      failureType,
-      consecutiveFailures: this.consecutiveFailures,
-      threshold: this.failureThreshold,
-      startLedger: details.startLedger,
-      endLedger: details.endLedger,
-      error: details.error,
-    };
-
-    logger.error("ledger_range_tracker operation failed", payload);
-
-    if (this.consecutiveFailures === this.failureThreshold) {
-      this.alertActive = true;
-      logger.warn(
-        "ledger_range_tracker alert: consecutive failure threshold reached",
-        {
-          ...payload,
-          action:
-            "Inspect RPC connectivity, indexer writes, and stall diagnostics; the tracker resumes automatically after the next successful operation.",
-        }
-      );
-    }
-
-    return this.consecutiveFailures;
-  }
-
-  recordSuccess(): void {
-    const hadFailures = this.consecutiveFailures > 0 || this.alertActive;
-    this.consecutiveFailures = 0;
-    this.lastSuccessfulAt = Date.now();
-    if (hadFailures) {
-      logger.info("ledger_range_tracker recovered after consecutive failures", {
-        tracker: this.tracker,
-      });
-    }
-    this.alertActive = false;
+  getFailureThreshold(): number {
+    return super.getFailureThreshold();
   }
 
   /**
@@ -661,13 +853,17 @@ export class LedgerRangeFailureMonitor {
    * successful poll can still recover cleanly. Returns true when stalled.
    */
   checkStall(range?: LedgerRange): boolean {
-    if (this.lastSuccessfulAt === null) return false;
-    const elapsedMs = Date.now() - this.lastSuccessfulAt;
+    const lastSuccess = this.getLastSuccessfulAt();
+    if (lastSuccess === null) return false;
+    const elapsedMs = Date.now() - lastSuccess;
     if (elapsedMs <= this.stallThresholdMs) return false;
+    if (this.stallAlerted) return true;
+
+    this.stallAlerted = true;
     logger.warn("ledger_range_tracker alert: poller stall threshold reached", {
-      tracker: this.tracker,
+      tracker: this.name,
       failureType: "stall" as const,
-      consecutiveFailures: this.consecutiveFailures,
+      consecutiveFailures: this.getConsecutiveFailures(),
       threshold: this.failureThreshold,
       stallThresholdMs: this.stallThresholdMs,
       elapsedMs,
@@ -680,9 +876,7 @@ export class LedgerRangeFailureMonitor {
   }
 
   reset(): void {
-    this.consecutiveFailures = 0;
-    this.lastSuccessfulAt = null;
-    this.alertActive = false;
+    super.reset();
   }
 }
 
@@ -787,10 +981,12 @@ export class LedgerRangeTracker {
   readonly name: string;
   readonly failureMonitor: LedgerRangeFailureMonitor;
   private readonly config: LedgerRangeTrackerConfig;
+  private readonly rpcRetryConfig: Partial<LedgerRangeRpcRetryConfig>;
 
   constructor(config: LedgerRangeTrackerConfig = {}) {
     this.config = config;
     this.name = config.name ?? TRACKER_NAME;
+    this.rpcRetryConfig = config.rpcRetryConfig ?? {};
     this.failureMonitor = new LedgerRangeFailureMonitor({
       name: this.name,
       failureThreshold: config.failureThreshold,
@@ -839,7 +1035,11 @@ export class LedgerRangeTracker {
             const pageStart = performance.now();
             let pageEvents: EventRow[];
             try {
-              pageEvents = await options.fetchEvents(page);
+              pageEvents = await withLedgerRangeRpcRetry(
+                async () => options.fetchEvents!(page),
+                this.rpcRetryConfig,
+                `${this.name}_fetchEvents`,
+              );
             } catch (err) {
               const error = err instanceof Error ? err.message : String(err);
               this.failureMonitor.recordFailure("event_retrieval", {

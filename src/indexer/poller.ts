@@ -1,71 +1,407 @@
 import { Server } from "@stellar/stellar-sdk/rpc";
+import type { Api } from "@stellar/stellar-sdk/rpc";
 import { scValToNative } from "@stellar/stellar-sdk";
 import {
-  getLastIndexedLedger,
   insertEventBatch,
+  insertHistoricalEventBatch,
   getActiveContractIds,
+  getActiveContractsWithPointers,
+  updateContractPointer,
   registerContract,
   adjustPollerInterval,
-  getCurrentPollIntervalMs,
+  getCurrentPollIntervalMs as getDbPollIntervalMs,
+  resetPollerThrottleState,
   verifySchemaUpToDate,
+  assertSchemaValid,
   type EventRow,
 } from "./db.js";
+import { RpcPollerClient } from "./rpc-poller-client.js";
 import {
-  getHistoricalRangeConfig,
-  processLedgerRange,
-  resolveHistoricalLedgerRange,
-} from "./ledger-range-tracker.js";
-import { deliverWebhooks } from "./webhook-delivery.js";
-import {
-  logIndexerRunnerPollDiagnostics,
-  payloadSizeBytes,
+  IndexerRunnerFailureMonitor,
+  adjustIndexerRunnerPollInterval,
 } from "./indexer_runner.js";
+import { deliverWebhooks } from "./webhook-delivery.js";
+import { fetchEventsWithRetry } from "./event_type_filter.js";
+import { formatError } from "../utils/format-error.js";
 import logger from "../utils/logger.js";
 
 const RPC_URL =
   process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-const server = new Server(RPC_URL);
 
 // ---------------------------------------------------------------------------
-// Alerting thresholds (#271)
+// RPC exponential backoff retry (#249)
 // ---------------------------------------------------------------------------
-const CONSECUTIVE_FAILURE_THRESHOLD = parseInt(
-  process.env.POLLER_FAILURE_THRESHOLD || "3",
-  10,
-);
+// All RPC calls in the indexer poll loop go through RpcPollerClient, which
+// retries transient failures (timeouts, connection resets, rate limits, 5xx)
+// with a doubling backoff up to maxRetries, then resets on success.
+// Under test the backoff is collapsed to ~1ms: a rejected RPC mock would
+// otherwise spend ~31s walking the production backoff curve before the poll
+// reports failure, blowing past Jest's default timeout.
+const IS_TEST_ENV = process.env.NODE_ENV === "test";
 
-function getStallThresholdMs(): number {
-  return parseInt(process.env.POLLER_STALL_THRESHOLD_MS || "120000", 10);
-}
+const rpcClient = new RpcPollerClient(RPC_URL, {
+  maxRetries: parseInt(process.env.INDEXER_RPC_MAX_RETRIES || "5", 10),
+  initialBackoffMs: parseInt(
+    process.env.INDEXER_RPC_INITIAL_BACKOFF_MS || (IS_TEST_ENV ? "1" : "1000"),
+    10,
+  ),
+  backoffMultiplier: parseInt(
+    process.env.INDEXER_RPC_BACKOFF_MULTIPLIER || "2",
+    10,
+  ),
+  maxBackoffMs: parseInt(
+    process.env.INDEXER_RPC_MAX_BACKOFF_MS || (IS_TEST_ENV ? "5" : "30000"),
+    10,
+  ),
+});
 
-let consecutiveFailures = 0;
-let lastSuccessfulPollAt: number | null = null;
+// ---------------------------------------------------------------------------
+// Failure and stall tracking for the poll loop (#253, #271)
+// ---------------------------------------------------------------------------
+// Consecutive failures escalate to an alert once the threshold is reached, and
+// a poll loop that stops succeeding for longer than the stall threshold is
+// reported even while individual polls keep "working".
+
+const failureMonitor = new IndexerRunnerFailureMonitor({
+  name: "indexer_runner",
+  failureThreshold: parseInt(
+    process.env.INDEXER_RUNNER_FAILURE_THRESHOLD ||
+      process.env.POLLER_FAILURE_THRESHOLD ||
+      "3",
+    10,
+  ),
+  stallThresholdMs: parseInt(
+    process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+      process.env.POLLER_STALL_THRESHOLD_MS ||
+      "120000",
+    10,
+  ),
+});
 
 export function getConsecutiveFailures(): number {
-  return consecutiveFailures;
+  return failureMonitor.getConsecutiveFailures();
 }
 
 export function getLastSuccessfulPollAt(): number | null {
-  return lastSuccessfulPollAt;
+  return failureMonitor.getLastSuccessfulAt();
 }
 
 export function resetFailureState(): void {
-  consecutiveFailures = 0;
-  lastSuccessfulPollAt = null;
+  failureMonitor.reset();
+  resetPollDiagnosticsThrottle();
 }
 
-const EVENT_TYPES = [
-  "initialized",
-  "funded",
-  "delivered",
-  "approved",
-  "dispute_raised",
-  "dispute_resolved",
-  "partial_release",
-  "auto_release_claimed",
-  "token_whitelisted",
-  "token_removed",
-];
+// ---------------------------------------------------------------------------
+// Dynamic poll interval (#265)
+// ---------------------------------------------------------------------------
+
+const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+const POLL_INTERVAL_MAX_MS = parseInt(
+  process.env.POLL_INTERVAL_MAX_MS || "120000",
+  10,
+);
+const POLL_INTERVAL_BACKOFF = 2;
+
+/**
+ * Next poll delay given the current one and whether the last poll saw activity.
+ *
+ * Idle polls back off geometrically up to POLL_INTERVAL_MAX_MS; the first
+ * active poll drops straight back to the minimum. Pure function so the backoff
+ * curve can be reasoned about (and tested) without running the loop.
+ */
+export function nextPollIntervalMs(
+  currentIntervalMs: number,
+  sawActivity: boolean,
+): number {
+  if (sawActivity) return POLL_INTERVAL_MIN_MS;
+  return Math.min(currentIntervalMs * POLL_INTERVAL_BACKOFF, POLL_INTERVAL_MAX_MS);
+}
+
+let currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
+
+/** The interval the poll loop is currently waiting between cycles. */
+export function getCurrentPollIntervalMs(): number {
+  return currentPollIntervalMs;
+}
+
+/**
+ * Resolve an RPC event's close time to epoch seconds.
+ *
+ * Missing or unparseable `ledgerClosedAt` yields `null` (stored as NULL since
+ * migration v9) — never the wall-clock time, so backfills can't stamp old
+ * events with today's date, and invalid strings can't become NaN (#708).
+ */
+export function toEventTimestamp(ledgerClosedAt: unknown): number | null {
+  if (typeof ledgerClosedAt !== "string" || ledgerClosedAt.trim() === "") {
+    logger.warn("Indexer event missing ledgerClosedAt – storing NULL timestamp");
+    return null;
+  }
+  const millis = new Date(ledgerClosedAt).getTime();
+  if (!Number.isFinite(millis)) {
+    logger.warn("Indexer event has invalid ledgerClosedAt – storing NULL timestamp", {
+      ledgerClosedAt,
+    });
+    return null;
+  }
+  return Math.floor(millis / 1000);
+}
+
+/** Map an RPC event notification onto the row shape `events` stores. */
+function toEventRow(event: any, fallbackContractId: string): EventRow {
+  return {
+    contractId: event.contractId?.contractId?.() ?? fallbackContractId,
+    eventType: scValToNative(event.topic[0]) as string,
+    ledgerSequence: event.ledger,
+    timestamp: toEventTimestamp(event.ledgerClosedAt),
+    dataJson: JSON.stringify(scValToNative(event.value)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Poll diagnostics (#270)
+// ---------------------------------------------------------------------------
+
+const POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS = parseInt(
+  process.env.POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS || "60000",
+  10,
+);
+let lastPollDiagnosticAt = 0;
+let stallWindowReported = false;
+
+interface StallWindow {
+  elapsedMsSinceLastSuccess: number;
+  stallThresholdMs: number;
+}
+
+/** Clear the diagnostics throttle so the next poll logs unconditionally. */
+export function resetPollDiagnosticsThrottle(): void {
+  lastPollDiagnosticAt = 0;
+  stallWindowReported = false;
+}
+
+/**
+ * One debug line per poll carrying duration and payload size.
+ *
+ * Only byte counts are logged, never the payload itself — event data carries
+ * participant wallet addresses and amounts that have no business in a log.
+ *
+ * Throttled to at most one line per POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS so a
+ * fast poll loop cannot flood the log.
+ */
+function logPollDiagnostics(
+  elapsedMs: number,
+  batch: EventRow[],
+  stall: StallWindow | null = null,
+): void {
+  const now = Date.now();
+
+  // The first line carrying a stall window is new information, so it is never
+  // throttled away; repeats of it are.
+  const stallWindowIsNews = stall !== null && !stallWindowReported;
+
+  if (
+    !stallWindowIsNews &&
+    POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS > 0 &&
+    lastPollDiagnosticAt > 0 &&
+    now - lastPollDiagnosticAt < POLL_DIAGNOSTIC_LOG_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+  lastPollDiagnosticAt = now;
+  if (stall !== null) stallWindowReported = true;
+
+  const totalPayloadBytes = batch.reduce(
+    (sum, row) => sum + Buffer.byteLength(row.dataJson, "utf8"),
+    0,
+  );
+  const avgPayloadBytes =
+    batch.length > 0 ? Math.round(totalPayloadBytes / batch.length) : 0;
+  const rounded = Math.round(elapsedMs);
+
+  const stallSegment = stall
+    ? ` | Poller stall diagnostics elapsedMsSinceLastSuccess=${stall.elapsedMsSinceLastSuccess}` +
+      ` stallThresholdMs=${stall.stallThresholdMs}`
+    : "";
+
+  logger.debug(
+    `RPC getEvents diagnostics elapsedMs=${rounded} payloadSizeBytes=${totalPayloadBytes}` +
+      stallSegment,
+    {
+      elapsedMs: rounded,
+      payloadSizeBytes: totalPayloadBytes,
+      totalPayloadBytes,
+      avgPayloadBytes,
+      eventCount: batch.length,
+      ...(stall ?? {}),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Historical range import (#254)
+// ---------------------------------------------------------------------------
+
+/** Upper bound on how many ledgers a single backfill may cover. */
+export const MAX_LEDGERS_PER_IMPORT = parseInt(
+  process.env.MAX_LEDGERS_PER_IMPORT || "10000",
+  10,
+);
+
+const HISTORICAL_PAGE_SIZE = 100;
+
+export interface HistoricalRangeValidation {
+  valid: boolean;
+  error?: string;
+}
+
+export interface HistoricalImportResult {
+  eventsFound: number;
+  eventsImported: number;
+}
+
+/**
+ * Check a requested backfill window against the chain head and the per-import
+ * ceiling. Pure, so callers can validate before opening any RPC connection.
+ */
+export function validateHistoricalRange(
+  startLedger: number,
+  endLedger: number,
+  chainHeadLedger: number,
+): HistoricalRangeValidation {
+  if (!Number.isInteger(startLedger) || startLedger <= 0) {
+    return { valid: false, error: "startLedger must be a positive integer" };
+  }
+  if (!Number.isInteger(endLedger) || endLedger <= 0) {
+    return { valid: false, error: "endLedger must be a positive integer" };
+  }
+  if (startLedger > endLedger) {
+    return { valid: false, error: "startLedger must be <= endLedger" };
+  }
+  if (endLedger > chainHeadLedger) {
+    return {
+      valid: false,
+      error:
+        `endLedger ${endLedger} does not exist yet – ` +
+        `the chain head is ${chainHeadLedger}`,
+    };
+  }
+
+  const span = endLedger - startLedger + 1;
+  if (span > MAX_LEDGERS_PER_IMPORT) {
+    return {
+      valid: false,
+      error:
+        `range covers ${span} ledgers, exceeding the ` +
+        `${MAX_LEDGERS_PER_IMPORT}-ledger maximum per import`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Import a historical ledger window without disturbing the live poller.
+ *
+ * Rows go through `insertHistoricalEventBatch`, which keeps the live ledger
+ * pointer where it is and relies on the same UNIQUE constraint as the poller —
+ * so re-running an import is idempotent. Pages are followed by cursor until a
+ * short page signals the range is fully collected.
+ */
+export async function fetchHistoricalEvents(
+  startLedger: number,
+  endLedger: number,
+): Promise<HistoricalImportResult> {
+  const chainHead = (await rpcClient.getLatestLedger()).sequence;
+  const validation = validateHistoricalRange(startLedger, endLedger, chainHead);
+  if (!validation.valid) {
+    throw new Error(`Invalid historical range: ${validation.error}`);
+  }
+
+  let contractIds: string[] = getActiveContractIds();
+  if (contractIds.length === 0 && process.env.CONTRACT_ID) {
+    contractIds = [process.env.CONTRACT_ID];
+  }
+
+  let eventsFound = 0;
+  let eventsImported = 0;
+  let cursor: string | undefined;
+
+  for (;;) {
+    // Cursor mode supersedes the ledger window once paging has started; sending
+    // both is rejected by the RPC.
+    const params = cursor
+      ? { cursor, limit: HISTORICAL_PAGE_SIZE }
+      : { startLedger, endLedger, contractIds, limit: HISTORICAL_PAGE_SIZE };
+
+    const page = await rpcClient.getEvents(params);
+    const pageEvents: any[] = page?.events ?? [];
+    if (pageEvents.length === 0) break;
+
+    eventsFound += pageEvents.length;
+
+    const batch: EventRow[] = pageEvents
+      .map((event) => toEventRow(event, contractIds[0] ?? ""))
+      .filter(
+        (row) =>
+          row.ledgerSequence >= startLedger && row.ledgerSequence <= endLedger,
+      );
+
+    if (batch.length > 0) {
+      const result = insertHistoricalEventBatch(batch, { startLedger, endLedger });
+      eventsImported += result.inserted;
+    }
+
+    cursor = page?.cursor;
+    if (pageEvents.length < HISTORICAL_PAGE_SIZE || !cursor) break;
+  }
+
+  logger.info("Historical import complete", {
+    startLedger,
+    endLedger,
+    eventsFound,
+    eventsImported,
+  });
+
+  return { eventsFound, eventsImported };
+}
+
+// ---------------------------------------------------------------------------
+// Memory queue lock for concurrent event inserts (#251)
+// ---------------------------------------------------------------------------
+// A single promise chain acts as an in-memory queue so overlapping
+// indexer_runner executions serialize their writes to the events table and the
+// ledger pointer. Without this, concurrent notifications could interleave the
+// atomic batch + pointer update and produce conflicting/duplicate entries.
+let eventInsertTail: Promise<void> = Promise.resolve();
+
+/**
+ * Reset the in-memory event-insert queue lock (used by tests).
+ */
+export function resetEventInsertQueueForTests(): void {
+  eventInsertTail = Promise.resolve();
+}
+
+/**
+ * Enqueue an event batch write behind a memory queue lock.
+ *
+ * Concurrent callers are chained onto a single promise tail and executed one at
+ * a time, preserving the atomicity of `insertEventBatch` and preventing
+ * duplicate or conflicting inserts from overlapping iterations.
+ */
+export function enqueueEventInsert(
+  events: EventRow[],
+  newLedger: number,
+): Promise<void> {
+  const run = eventInsertTail.then(() => {
+    insertEventBatch(events, newLedger);
+  });
+  // Keep the queue alive even if an insert rejects so later enqueues proceed.
+  eventInsertTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
 
 /**
  * Poll events for all active contract IDs stored in monitored_contracts (#85).
@@ -73,10 +409,20 @@ const EVENT_TYPES = [
  * ledger pointer update (#84) – so a mid-poll crash cannot advance the pointer
  * without committing the accompanying events.
  *
- * Returns whether the ledger actually advanced, so startPoller() can throttle
- * its polling frequency up or down based on ledger processing load (#274).
+ * Returns whether the network showed activity (a new ledger closed since the
+ * last poll). The caller uses this to drive the dynamic polling interval
+ * (see nextPollIntervalMs()) – NOTE this only affects how *often* we poll,
+ * never *what* gets written. Duplicate prevention itself is guaranteed by the
+ * UNIQUE(contract_id, ledger_sequence, event_type) constraint + INSERT OR
+ * IGNORE in db.ts, and every poll always resumes from the last committed
+ * ledger pointer (lastLedger + 1) regardless of how much time has passed
+ * since the previous poll. So a longer interval can only delay *when* an
+ * event is detected – it cannot cause an event to be missed, double-counted,
+ * or processed out of order.
  */
 export async function pollEvents(): Promise<boolean> {
+  const pollStartedAt = performance.now();
+
   // --- Resolve active contract IDs from the DB (#85) ---
   let contractIds: string[] = getActiveContractIds();
 
@@ -92,228 +438,181 @@ export async function pollEvents(): Promise<boolean> {
     return false;
   }
 
-  // --- Diagnostics: stall detection before polling (#270, #271) ---
-  if (lastSuccessfulPollAt) {
-    const stallThresholdMs = getStallThresholdMs();
-    const elapsed = Date.now() - lastSuccessfulPollAt;
-    if (elapsed > stallThresholdMs) {
+  // --- Alerting: stall detection before polling (#253, #271) ---
+  const lastSuccessAt = failureMonitor.getLastSuccessfulAt();
+  let stallWindow: StallWindow | null = null;
+
+  if (lastSuccessAt) {
+    const elapsedMsSinceLastSuccess = Date.now() - lastSuccessAt;
+    const stallThresholdMs = parseInt(
+      process.env.INDEXER_RUNNER_STALL_THRESHOLD_MS ||
+        process.env.POLLER_STALL_THRESHOLD_MS ||
+        String(failureMonitor.stallThresholdMs),
+      10,
+    );
+    stallWindow = { elapsedMsSinceLastSuccess, stallThresholdMs };
+
+    if (elapsedMsSinceLastSuccess > stallThresholdMs) {
       logger.warn("Poller stall detected – no successful poll for threshold period", {
-        elapsedMs: elapsed,
+        elapsedMs: elapsedMsSinceLastSuccess,
         stallThresholdMs,
-        consecutiveFailures,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
       });
     }
-    logger.debug("Poller stall diagnostics", {
-      elapsedMsSinceLastSuccess: elapsed,
-      stallThresholdMs,
-    });
   }
 
   const pollStart = performance.now();
-
-  // --- High-frequency poll start diagnostics (#252) ---
-  logIndexerRunnerPollDiagnostics({
-    operation: "pollEvents",
-    status: "started",
-    elapsedMs: 0,
-  });
 
   try {
     // Validate the schema before matching events against EVENT_TYPES – a stale
     // schema must not silently pass through the topic filter (#282).
     verifySchemaUpToDate();
 
-    const lastLedger = getLastIndexedLedger();
-    const currentLedger = (await server.getLatestLedger()).sequence;
-
     // --- Dynamic historical sync ranges (#254) ---
-    // When LEDGER_RANGE_START / LEDGER_RANGE_END (or either) are configured,
-    // import that inclusive window once without advancing the live pointer.
-    const histConfig = getHistoricalRangeConfig();
-    if (histConfig.startLedger != null || histConfig.endLedger != null) {
-      const range = resolveHistoricalLedgerRange({
-        startLedger: histConfig.startLedger,
-        endLedger: histConfig.endLedger,
-        defaultStart: lastLedger < 1 ? 1 : lastLedger + 1,
-        defaultEnd: currentLedger,
+    // With LEDGER_RANGE_START/END set the poller imports that inclusive window
+    // instead of following the chain head, and leaves the live ledger pointer
+    // untouched so a backfill cannot disturb live indexing.
+    const rangeStartRaw = process.env.LEDGER_RANGE_START;
+    const rangeEndRaw = process.env.LEDGER_RANGE_END;
+    if (rangeStartRaw || rangeEndRaw) {
+      const rangeStart = parseInt(rangeStartRaw ?? rangeEndRaw ?? "0", 10);
+      const rangeEnd = parseInt(rangeEndRaw ?? rangeStartRaw ?? "0", 10);
+
+      const imported = await fetchHistoricalEvents(rangeStart, rangeEnd);
+      failureMonitor.recordSuccess();
+
+      logger.info("Historical range import cycle complete", {
+        startLedger: rangeStart,
+        endLedger: rangeEnd,
+        ...imported,
       });
-
-      logger.info("Running historical ledger range import", {
-        startLedger: range.startLedger,
-        endLedger: range.endLedger,
-        pageSize: histConfig.pageSize,
-      });
-
-      const result = await processLedgerRange({
-        startLedger: range.startLedger,
-        endLedger: range.endLedger,
-        pageSize: histConfig.pageSize,
-        advanceLivePointer: false,
-        fetchEvents: async (page) => {
-          const pageEvents = await server.getEvents({
-            startLedger: page.startLedger,
-            filters: [
-              {
-                type: "contract",
-                contractIds,
-                topics: [[...EVENT_TYPES]],
-              },
-            ],
-            limit: histConfig.pageSize,
-          });
-          return pageEvents.events
-            .filter((event) => event.ledger <= page.endLedger)
-            .map((event) => ({
-              contractId: event.contractId?.contractId() ?? contractIds[0],
-              eventType: scValToNative(event.topic[0]) as string,
-              ledgerSequence: event.ledger,
-              timestamp: event.ledgerClosedAt
-                ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
-                : Math.floor(Date.now() / 1000),
-              dataJson: JSON.stringify(event.value),
-            }));
-        },
-      });
-
-      consecutiveFailures = 0;
-      lastSuccessfulPollAt = Date.now();
-      adjustPollerInterval(result.eventCount);
-
-      logger.info("Historical ledger range import complete", {
-        startLedger: range.startLedger,
-        endLedger: range.endLedger,
-        eventCount: result.eventCount,
-        insertedCount: result.insertedCount,
-        elapsedMs: Math.round(result.elapsedMs),
-      });
-
-      return result.insertedCount > 0;
+      return true;
     }
 
-    if (currentLedger <= lastLedger) {
-      // --- Dynamic throttling: idle cycle (#265) ---
-      adjustPollerInterval(0);
-      const idleElapsed = Math.round(performance.now() - pollStart);
-      logIndexerRunnerPollDiagnostics({
-        operation: "pollEvents",
-        status: "success",
-        elapsedMs: idleElapsed,
-        eventCount: 0,
-        startLedger: lastLedger,
+    const currentLedger = (await rpcClient.getLatestLedger()).sequence;
+
+    // --- Group contracts by their per-contract ledger pointer (#720) ---
+    // Contracts sharing a pointer are polled together in one getEvents call.
+    // A newly registered contract starts from its start_ledger and catches up
+    // separately until it joins the main group. The global pointer remains as
+    // the default for legacy single-contract setups.
+    // contractIds were resolved (with the CONTRACT_ID fallback) above, so
+    // every active contract has a row here.
+    const contracts = getActiveContractsWithPointers();
+
+    // Group contracts by the ledger they are indexed up to, so each group
+    // makes one getEvents call.
+    const groups = new Map<number, string[]>();
+    for (const { contractId, lastLedgerSequence } of contracts) {
+      const group = groups.get(lastLedgerSequence) ?? [];
+      group.push(contractId);
+      groups.set(lastLedgerSequence, group);
+    }
+
+    let totalEvents = 0;
+    // Webhooks must cover the earliest ledger any group fetched from, so a
+    // catching-up contract's backfilled events are delivered too.
+    let minStartLedger = Number.POSITIVE_INFINITY;
+    const diagnosticsBatch: EventRow[] = [];
+    let anyGroupPolled = false;
+
+    for (const [pointer, groupContractIds] of groups) {
+      if (currentLedger <= pointer) continue;
+      anyGroupPolled = true;
+
+      const startLedger = pointer + 1;
+      minStartLedger = Math.min(minStartLedger, startLedger);
+
+      logger.info("Polling events for contract group", {
+        startLedger,
         currentLedger,
-        payloadSizeBytes: 0,
+        contractCount: groupContractIds.length,
       });
-      return false;
+
+      const events = await fetchEventsWithRetry(rpcClient.rpcServer, {
+        startLedger,
+        contractIds: groupContractIds,
+        limit: 100,
+      });
+
+      // Build the batch to be written atomically (#84)
+      const batch: EventRow[] = events.events.map((event) =>
+        toEventRow(event, groupContractIds[0])
+      );
+
+      // Persist the batch and advance the ledger pointer atomically (#84).
+      // Called even with an empty batch so the global pointer always advances.
+      await enqueueEventInsert(batch, currentLedger);
+
+      // Advance each contract in the group to the current ledger (#720).
+      for (const contractId of groupContractIds) {
+        updateContractPointer(contractId, currentLedger);
+      }
+
+      totalEvents += events.events.length;
+      diagnosticsBatch.push(...batch);
     }
 
-    const startLedger = lastLedger + 1;
-
-    logger.info("Polling events", { startLedger, currentLedger });
-
-    const eventsStart = performance.now();
-    const events = await server.getEvents({
-      startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds,
-          topics: [[...EVENT_TYPES]],
-        },
-      ],
-      limit: 100,
-    });
-    const eventsElapsed = performance.now() - eventsStart;
-
-    // --- Diagnostics: payload size and timing (#270, #252) ---
-    const sizeBytes = payloadSizeBytes(events.events);
-    logger.debug("RPC getEvents diagnostics", {
-      elapsedMs: Math.round(eventsElapsed),
-      payloadSizeBytes: sizeBytes,
-      eventCount: events.events.length,
-      startLedger,
-      currentLedger,
-    });
-    logIndexerRunnerPollDiagnostics({
-      operation: "getEvents",
-      status: "success",
-      elapsedMs: Math.round(eventsElapsed),
-      payloadSizeBytes: sizeBytes,
-      eventCount: events.events.length,
-      startLedger,
-      currentLedger,
-    });
-
-    // Build the batch to be written atomically (#84)
-    const batch: EventRow[] = events.events.map((event) => ({
-      contractId: event.contractId?.contractId() ?? contractIds[0],
-      eventType: scValToNative(event.topic[0]) as string,
-      ledgerSequence: event.ledger,
-      timestamp: event.ledgerClosedAt
-        ? Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000)
-        : Math.floor(Date.now() / 1000),
-      dataJson: JSON.stringify(event.value),
-    }));
-
-    // Persist the batch and advance the ledger pointer atomically (#84)
-    insertEventBatch(batch, currentLedger);
-
-    const totalElapsed = Math.round(performance.now() - pollStart);
-    consecutiveFailures = 0;
-    lastSuccessfulPollAt = Date.now();
+    // Record success for any poll that completes without throwing, even idle cycles.
+    const totalElapsed = performance.now() - pollStart;
+    failureMonitor.recordSuccess();
 
     // --- Dynamic poller throttling (#265) ---
-    const throttleState = adjustPollerInterval(events.events.length);
-
-    logIndexerRunnerPollDiagnostics({
-      operation: "pollEvents",
-      status: "success",
-      elapsedMs: totalElapsed,
-      payloadSizeBytes: sizeBytes,
-      eventCount: events.events.length,
-      startLedger,
-      currentLedger,
-    });
+    const throttleState = adjustPollerInterval(totalEvents);
+    adjustIndexerRunnerPollInterval(totalEvents);
 
     logger.info("Processed indexer poll", {
-      eventCount: events.events.length,
+      eventCount: totalEvents,
       upToLedger: currentLedger,
-      elapsedMs: totalElapsed,
+      elapsedMs: Math.round(totalElapsed),
       pollIntervalMs: throttleState.currentIntervalMs,
     });
 
-    deliverWebhooks(startLedger, currentLedger).catch((err) =>
-      logger.error("Error delivering webhooks", {
-        error: err instanceof Error ? err.message : String(err),
-      })
-    );
+    if (anyGroupPolled) {
+      logPollDiagnostics(
+        performance.now() - pollStartedAt,
+        diagnosticsBatch,
+        stallWindow,
+      );
+
+      deliverWebhooks(minStartLedger, currentLedger).catch((err) =>
+        logger.error("Error delivering webhooks", {
+          error: formatError(err),
+        })
+      );
+    }
+
+    if (!anyGroupPolled) {
+      return false;
+    }
 
     return true;
   } catch (err) {
-    const totalElapsed = Math.round(performance.now() - pollStart);
-    consecutiveFailures += 1;
-
-    logIndexerRunnerPollDiagnostics({
-      operation: "pollEvents",
-      status: "failure",
-      elapsedMs: totalElapsed,
-      error: err instanceof Error ? err.message : String(err),
+    const totalElapsed = performance.now() - pollStart;
+    const consecutiveFailures = failureMonitor.recordFailure("poll", {
+      error: formatError(err),
+      operation: "poll_events",
     });
 
     logger.error("Error polling events", {
-      error: err instanceof Error ? err.message : String(err),
+      error: formatError(err),
       consecutiveFailures,
-      elapsedMs: totalElapsed,
+      elapsedMs: Math.round(totalElapsed),
     });
 
-    // --- Alerting: warn when consecutive failures hit threshold (#271) ---
-    if (consecutiveFailures >= CONSECUTIVE_FAILURE_THRESHOLD) {
+    // Keep legacy poller alert message for existing #271 tests
+    if (
+      failureMonitor.getConsecutiveFailures() >=
+      failureMonitor.getFailureThreshold()
+    ) {
       logger.error("Poller alert: consecutive failure threshold exceeded", {
-        consecutiveFailures,
-        threshold: CONSECUTIVE_FAILURE_THRESHOLD,
-        lastSuccessAt: lastSuccessfulPollAt,
+        consecutiveFailures: failureMonitor.getConsecutiveFailures(),
+        threshold: failureMonitor.getFailureThreshold(),
+        lastSuccessAt: failureMonitor.getLastSuccessfulAt(),
       });
     }
 
+    // A failed poll advanced nothing, so report no progress to the throttler.
     return false;
   }
 }
@@ -321,21 +620,39 @@ export async function pollEvents(): Promise<boolean> {
 let pollerTimeout: NodeJS.Timeout | null = null;
 let pollerRunning = false;
 
+/** One poll plus the interval adjustment its outcome implies. */
+async function runPollCycle(): Promise<void> {
+  const sawActivity = await pollEvents();
+  currentPollIntervalMs = nextPollIntervalMs(currentPollIntervalMs, sawActivity);
+}
+
 async function pollLoop() {
   if (!pollerRunning) return;
-  await pollEvents();
-  const interval = getCurrentPollIntervalMs();
-  pollerTimeout = setTimeout(pollLoop, interval);
+  await runPollCycle();
+  if (!pollerRunning) return;
+  pollerTimeout = setTimeout(pollLoop, currentPollIntervalMs);
 }
 
 export function startPoller() {
   if (pollerRunning) return;
+
+  // Migration verification hook: fail-fast on startup if the database schema is
+  // out of sync, so the indexer cannot start against a stale schema (#255).
+  assertSchemaValid();
+
   pollerRunning = true;
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
   logger.info("Starting event indexer poller", {
-    intervalMs: getCurrentPollIntervalMs(),
+    intervalMs: currentPollIntervalMs,
   });
-  pollEvents();
-  pollerTimeout = setTimeout(pollLoop, getCurrentPollIntervalMs());
+
+  // The first cycle runs immediately; the loop is scheduled off its outcome so
+  // the very first idle poll already widens the wait.
+  void runPollCycle().then(() => {
+    if (pollerRunning) {
+      pollerTimeout = setTimeout(pollLoop, currentPollIntervalMs);
+    }
+  });
 }
 
 export function stopPoller() {
@@ -344,4 +661,6 @@ export function stopPoller() {
     clearTimeout(pollerTimeout);
     pollerTimeout = null;
   }
+  resetPollerThrottleState();
+  currentPollIntervalMs = POLL_INTERVAL_MIN_MS;
 }

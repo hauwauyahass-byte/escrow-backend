@@ -12,6 +12,7 @@ Express + TypeScript backend for the Soroban milestone escrow platform.
 ## Table of Contents
 
 - [Setup](#setup)
+- [Architecture](#architecture)
 - [API Endpoints](#api-endpoints)
   - [GET /health](#get-health)
   - [GET /api/jobs/:contractid](#get-apijobss-contractid)
@@ -28,7 +29,19 @@ cp .env.example .env  # add your contract ID and deployer address
 npm run dev
 ```
 
+## Architecture
+
+- [Architecture overview](./docs/ARCHITECTURE.md) — live request/indexer paths and reachability table
+- [CSV serialization guide](./docs/CSV_SERIALIZATION_GUIDE.md)
+- [Webhook delivery](./docs/webhooks.md) — event types, payload shapes, retry policy
+
 ## API Endpoints
+
+### API Versioning
+
+New integrations should use `/api/v1`. Existing `/api` routes remain available
+for compatibility and return `Deprecation: true`; response-shape changes belong
+in a new API version rather than silently changing a published version.
 
 ### GET /health
 

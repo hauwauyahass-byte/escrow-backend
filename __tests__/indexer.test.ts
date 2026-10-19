@@ -61,14 +61,21 @@ describe("Indexer Database", () => {
 
     it("does not re-apply already-applied migrations (idempotent)", () => {
       // Running again should not throw and should not duplicate rows
+      const before = testDb
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all() as Array<{ version: number }>;
+
       runMigrations();
-      const rows = testDb
-        .prepare("SELECT version FROM schema_migrations")
-        .all();
-      // We ship 5 migrations (events/indexer_state + monitored_contracts + indexes +
-      // ledger range indexes + schema-manager lookup indexes)
-      const versions = [...new Set((rows as any[]).map((r) => r.version))];
-      expect(versions.length).toBe(5);
+
+      const after = testDb
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all() as Array<{ version: number }>;
+      expect(after).toEqual(before);
+
+      // The full migration set is applied exactly once (sequential from 1).
+      const versions = after.map((r) => r.version);
+      expect(new Set(versions).size).toBe(versions.length);
+      expect(Math.min(...versions)).toBe(1);
     });
   });
 

@@ -2,8 +2,12 @@ node_modules/
 dist/
 .env
 .tools/
+.kiro/
 *.log
 data/
 .agents/
 issue.md
 skills-lock.json
+# Exit-code artifacts written by verify-ci.js
+*.exit
+docker-compose.local.yml

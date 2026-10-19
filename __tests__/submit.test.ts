@@ -18,11 +18,13 @@ jest.unstable_mockModule("../src/middleware/job-contract-rate-limit.js", () => (
   jobContractRateLimit: (_req: any, _res: any, next: any) => next(),
   partialReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   jobWhitelistRateLimit: (_req: any, _res: any, next: any) => next(),
+  whitelistUpdateRateLimit: (_req: any, _res: any, next: any) => next(),
   buildTxRateLimit: (_req: any, _res: any, next: any) => next(),
   timeRemainingRateLimit: (_req: any, _res: any, next: any) => next(),
   createJobDraftRateLimit: (_req: any, _res: any, next: any) => next(),
   claimAutoReleaseRateLimit: (_req: any, _res: any, next: any) => next(),
   resetSubmitRateLimitBuckets: () => {},
+  resetWhitelistUpdateRateLimitBuckets: () => {},
 }));
 
 jest.unstable_mockModule("@stellar/stellar-sdk/rpc", () => ({
@@ -47,6 +49,7 @@ jest.unstable_mockModule("@stellar/stellar-sdk", () => ({
   },
   BASE_FEE: "100",
   nativeToScVal: jest.fn(),
+  scValToNative: jest.fn((val: unknown) => val),
   Address: {
     fromString: jest.fn(() => ({ toScVal: jest.fn() })),
   },
@@ -251,15 +254,15 @@ describe("POST /api/jobs/submit – error sanitization", () => {
     expect(typeof res.body.error).toBe("string");
   });
 
-  it("returns sanitized 500 for timeout errors", async () => {
+  it("returns a sanitized 504 for upstream timeout errors (#691)", async () => {
     mockSendTransaction.mockRejectedValue(new Error("Request timeout after 30000ms"));
 
     const res = await request(buildApp())
       .post("/api/jobs/submit")
       .send({ signedXdr: VALID_SIGNED_XDR })
-      .expect(500);
+      .expect(504);
 
-    expect(res.body).toEqual({ success: false, error: "Internal server error" });
+    expect(res.body).toEqual({ success: false, error: "Upstream RPC timeout" });
     expect(JSON.stringify(res.body)).not.toContain("30000ms");
   });
 
